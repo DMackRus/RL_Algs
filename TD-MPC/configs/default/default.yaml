@@ -1,0 +1,59 @@
+name: TD-MPC (default)
+
+# Task parameters
+max_episode_length: 600
+image_observations: True
+
+training_rounds: 200
+training_steps_per_round: 100
+num_episodes_per_round: 3
+eval_policy_every: 5
+
+# More specific training parameters
+noisy_action_training: True
+noisy_action_experience: True
+
+# General Neural Network Training Hyperparameters
+learning_rate: 1e-3
+learning_rate_actor: 1e-4
+batch_size: 256
+latent_dim: 32
+hidden_dim: 256
+gamma: 0.99
+time_lambda: 0.5
+reward_loss_weight: 0.5
+value_loss_weight: 0.2
+consistency_loss_weight: 1.0
+
+# Sampling planner
+sampler: predictive-sampling
+horizon: 5
+sampling_noise: 0.3
+optimization_iterations: 10
+sample_size: 256
+
+
+predictive-sampling:
+  # The number of candidate action sequences to sample at each time step
+  num_candidates: 256
+  # The standard deviation of the Gaussian noise added to the action sequences during sampling
+  noise_std: 0.3
+
+MPPI:
+  # The number of candidate action sequences to sample at each time step
+  num_candidates: 256
+  # The standard deviation of the Gaussian noise added to the action sequences during sampling
+  noise_std: 0.3
+  # Temperature coefficient for softmax weighting
+  temperature: 1.0
+  # Number of optimization iterations
+  num_opt_iterations: 5
+
+CEM:
+  # The number of candidate action sequences to sample at each time step
+  num_candidates: 256
+  # The number of elite candidates to select for updating the distribution
+  num_elites: 64
+  # The standard deviation of the Gaussian noise added to the action sequences during sampling
+  noise_std: 0.1
+

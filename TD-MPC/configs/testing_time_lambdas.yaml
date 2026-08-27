@@ -1,0 +1,2 @@
+default_config: default
+time_lambda: [0.1, 0.2, 0.5, 0.8, 1.0]

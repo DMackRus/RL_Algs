@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+__pycache__
+
+**/__pycache__/
+DQN/checkpoints
+TD-MPC/model_checkpoints/*
+
+TD-MPC/configs/*checkpoint*
+TD-MPC/configs/**/checkpoint/
+TD-MPC/configs/**/*checkpoint*
