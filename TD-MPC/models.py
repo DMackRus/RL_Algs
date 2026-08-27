@@ -8,23 +8,26 @@ class RepresentationModel(nn.Module):
     Input:  (B, state_dim)
     Output: (B, latent_dim)
     """
-    def __init__(self, latent_dim, state_space, hidden_dim=256, image_state=True):
+    def __init__(self, latent_dim, state_space, hidden_dim=256, image_state=True, frame_stack=1):
         super().__init__()
         #observations are 64x64 images, so we need to use a convolutional neural network to process them
 
+        self.image_state = image_state
+
         if image_state:
+            C = 3 * frame_stack
             self.net = nn.Sequential(
-                nn.Conv2d(3, 32, kernel_size=8, stride=4),
+                nn.Conv2d(C, 32, kernel_size=8, stride=4),
                 nn.ReLU(),
                 nn.Conv2d(32, 64, kernel_size=4, stride=2),
                 nn.ReLU(),
                 nn.Conv2d(64, 64, kernel_size=3, stride=1),
                 nn.ReLU(),
                 nn.Flatten(),
-                nn.Linear(64 * 4 * 4, hidden_dim),
+                nn.Linear(64 * 4 * 4, hidden_dim),   # spatial dims unchanged → still 1024
                 nn.ReLU(),
                 nn.Linear(hidden_dim, latent_dim),
-                nn.LayerNorm(latent_dim)
+                nn.LayerNorm(latent_dim),
             )
         else:
             self.net = nn.Sequential(
@@ -37,8 +40,10 @@ class RepresentationModel(nn.Module):
             )
 
     def forward(self, x):
-        # x is a batch of images, so we need to permute the dimensions to match the expected input of the convolutional layers
-        # x = x.permute(0, 3, 1, 2)  # (B, H, W, C) -> (B, C, H, W)
+        # Image observations are stored as uint8 [0, 255] to save memory;
+        # normalize to [-1, 1] here so every caller (planner + update) shares it.
+        if self.image_state:
+            x = (x.float() / 255.0 - 0.5) / 0.5
         return self.net(x)
 
 class LatentDynamics(nn.Module):

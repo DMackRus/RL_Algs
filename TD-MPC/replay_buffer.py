@@ -67,8 +67,10 @@ class ReplayBuffer:
         self.device = device
 
         if image_observations:
-            self.states = np.zeros((capacity, *state_dim), dtype=np.float32)
-            self.next_states = np.zeros((capacity, *state_dim), dtype=np.float32)
+            # uint8 [0, 255] -- 4x less memory than float32. RepresentationModel
+            # normalizes to [-1, 1] on the way in.
+            self.states = np.zeros((capacity, *state_dim), dtype=np.uint8)
+            self.next_states = np.zeros((capacity, *state_dim), dtype=np.uint8)
         else:
             self.states = np.zeros((capacity, state_dim), dtype=np.float32)
             self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
