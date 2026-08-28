@@ -6,7 +6,7 @@ import numpy as np
 import torch as T
 import torch.nn as nn
 
-def plot_training(training_file="training_stats.npz", window=25):
+def plot_training(training_file="default/training_stats.npz", window=25):
     """Plot episode rewards and lengths with rolling averages."""
 
     if not os.path.exists(training_file):
@@ -63,7 +63,7 @@ def plot_training(training_file="training_stats.npz", window=25):
 
 def main():
 
-    plot_training("training_stats.npz", window=25)
+    plot_training("default/training_stats.npz", window=25)
 
 if __name__ == "__main__":
     main()

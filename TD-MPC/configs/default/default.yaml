@@ -4,7 +4,8 @@ name: TD-MPC (default)
 max_episode_length: 600
 image_observations: True
 
-training_rounds: 500
+# Training parameters
+training_rounds: 200
 training_steps_per_round: 100
 num_episodes_per_round: 3
 eval_policy_every: 5
@@ -16,7 +17,7 @@ noisy_action_experience: True
 # General Neural Network Training Hyperparameters
 frame_stack: 3
 aug_pad: 4          # DrQ random-shift padding in pixels; 0 disables augmentation
-learning_rate: 1e-3
+learning_rate: 3e-4
 learning_rate_actor: 1e-4
 batch_size: 256
 latent_dim: 50
@@ -24,7 +25,7 @@ hidden_dim: 256
 gamma: 0.99
 time_lambda: 0.5
 reward_loss_weight: 0.5
-value_loss_weight: 0.2
+value_loss_weight: 0.5
 consistency_loss_weight: 1.0
 
 # Sampling planner
@@ -45,7 +46,7 @@ MPPI:
   # The number of candidate action sequences to sample at each time step
   num_candidates: 256
   # The standard deviation of the Gaussian noise added to the action sequences during sampling
-  noise_std: 0.3
+  noise_std: 0.2
   # Temperature coefficient for softmax weighting
   temperature: 1.0
   # Number of optimization iterations

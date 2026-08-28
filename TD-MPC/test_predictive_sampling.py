@@ -11,14 +11,15 @@ from models import (
 )
 
 from planner import PredictiveSampler, MPPISampler
+from utils import process_image, make_frame_stacker
 import yaml
 
 # ============================================================
 # Configuration
 # ============================================================
 
-# CHECKPOINT_PATH = "configs/default/model_checkpoints/checkpoint_round150.pt"
-CHECKPOINT_PATH = "lunar_lander_solved.pt"
+CHECKPOINT_PATH = "configs/default/model_checkpoints/checkpoint_round195.pt"
+# CHECKPOINT_PATH = "lunar_lander_solved.pt"
 # CHECKPOINT_PATH = "configs/testing_horizons/horizon_10/model_checkpoints/checkpoint_round195.pt"
 
 DEVICE = T.device(
@@ -32,11 +33,6 @@ def main():
 
     print("Using device:", DEVICE)
 
-    env = gym.make("LunarLanderContinuous-v3", render_mode="human")
-    # env = gym.make("Walker2d-v5", render_mode="human")
-    # env = gym.make("BipedalWalker-v3", render_mode="human")
-
-
     print("Loading checkpoint...")
 
     checkpoint = T.load(
@@ -46,13 +42,24 @@ def main():
 
     config_filepath = "configs/default/default.yaml"
     with open(config_filepath, "r") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader) 
+        config = yaml.load(f, Loader=yaml.FullLoader)
 
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
     IMAGE_OBSERVATIONS = config["image_observations"]
+    FRAME_STACK = config.get("frame_stack", 1)
     LATENT_DIM = config["latent_dim"]
     HIDDEN_DIM = config["hidden_dim"]
+
+    # Image mode needs rgb frames from env.render(); "human" render returns None.
+    render_mode = "rgb_array" if IMAGE_OBSERVATIONS else "human"
+    # env = gym.make("LunarLanderContinuous-v3", render_mode=render_mode)
+    env = gym.make("Walker2d-v5", render_mode=render_mode)
+    # env = gym.make("BipedalWalker-v3", render_mode=render_mode)
+
+    action_dim = env.action_space.shape[0]
+    if IMAGE_OBSERVATIONS:
+        state_dim = (3 * FRAME_STACK, 64, 64)  # (C, H, W)
+    else:
+        state_dim = env.observation_space.shape[0]
 
     # --------------------------------------------------------
     # Build models
@@ -63,6 +70,7 @@ def main():
         state_dim,
         HIDDEN_DIM,
         image_state=IMAGE_OBSERVATIONS,
+        frame_stack=FRAME_STACK,
     )
 
 
@@ -162,19 +170,24 @@ def main():
 
         state, info = env.reset()
 
+        stack_push = None
+        if IMAGE_OBSERVATIONS:
+            # New frame stacker per episode. reset() copies the first frame
+            # FRAME_STACK times so we start with a full (3*FRAME_STACK, 64, 64) stack.
+            stack_reset, stack_push = make_frame_stacker(FRAME_STACK)
+            state = stack_reset(process_image(env.render()))
+
         done = False
         total_reward = 0
 
         while not done:
 
-
             # State -> latent
 
-            state_tensor = T.tensor(
-                state,
-                dtype=T.float32,
-                device=DEVICE,
-            ).unsqueeze(0)
+            if isinstance(state, np.ndarray):
+                state_tensor = T.from_numpy(state).unsqueeze(0).float().to(DEVICE)
+            else:
+                state_tensor = state.unsqueeze(0).float().to(DEVICE)
 
             with T.no_grad():
 
@@ -187,6 +200,9 @@ def main():
             state, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             total_reward += reward
+
+            if IMAGE_OBSERVATIONS:
+                state = stack_push(process_image(env.render()))
 
 
             # print(
