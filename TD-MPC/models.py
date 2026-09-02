@@ -32,9 +32,9 @@ class RepresentationModel(nn.Module):
         else:
             self.net = nn.Sequential(
                 nn.Linear(state_space, hidden_dim),
-                nn.ReLU(),
+                nn.ELU(),
                 nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
+                nn.ELU(),
                 nn.Linear(hidden_dim, latent_dim),
                 nn.LayerNorm(latent_dim)
             )
@@ -97,10 +97,10 @@ class ValuePredictor(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(latent_dim + action_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),  # TODO What does elementwise_affine do?
+            nn.LayerNorm(hidden_dim),
             nn.Tanh(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ELU(alpha=1.0),
+            nn.ELU(),
             nn.Linear(hidden_dim, 1)
         )
 

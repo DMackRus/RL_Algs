@@ -25,8 +25,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Env used for the pixel pipeline. Must be created with render_mode="rgb_array"
 # so env.render() returns an (H, W, 3) uint8 frame.
-ENV_ID = "LunarLanderContinuous-v3"
-# ENV_ID = "Walker2d-v5"
+# ENV_ID = "LunarLanderContinuous-v3"
+ENV_ID = "Walker2d-v5"
 
 
 def _chw_uint8_to_hwc(img: T.Tensor) -> np.ndarray:
@@ -40,7 +40,7 @@ def visualise_trajectory(env_id: str = ENV_ID, num_steps: int = 8, seed: int = 0
       top row    -- the full-resolution frame from env.render()
       bottom row -- the same frame after process_image() (resize to 64x64)
     """
-    env = gym.make(env_id, render_mode="rgb_array")
+    env = gym.make(env_id, render_mode="rgb_array", reset_noise_scale=0.01)
     env.reset(seed=seed)
 
     raw_frames = []       # list of (H, W, 3) uint8
@@ -204,7 +204,7 @@ def overfit_batch_test(config_filepath, num_steps=3000, log_every=50, num_collec
     print(f"Buffer size: {len(replay_buffer)}")
 
     # --- freeze ONE batch ---
-    states, actions, rewards, next_states, dones, terminateds, weights = replay_buffer.sample()
+    states, actions, rewards, next_states, dones, terminateds, weights, masks = replay_buffer.sample()
     states = states.clone()
     actions = actions.clone()
     rewards = rewards.clone()

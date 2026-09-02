@@ -226,3 +226,4 @@ TD-MPC/model_checkpoints/*
 TD-MPC/configs/*checkpoint*
 TD-MPC/configs/**/checkpoint/
 TD-MPC/configs/**/*checkpoint*
+TD-MPC/configs/**/eval_videos/
