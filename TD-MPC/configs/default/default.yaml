@@ -4,22 +4,12 @@ device: cuda
 # Task parameters
 task: walker-walk        # dm_control domain-task (e.g. cheetah-run, cartpole-swingup, quadruped-run)
 action_repeat: 2         # env steps executed per agent action
-max_episode_length: 600
 image_observations: False
 
 # Training parameters
-training_rounds: 400
-training_steps_per_round: 100   # only used when updates_per_env_step is null
 seed_steps: 5000
-num_episodes_per_round: 3
 eval_policy_every: 5
-seed_episodes: 50               # uniform random-action episodes to seed the buffer
-updates_per_env_step: None       # gradient steps per env step collected (UTD ratio); null -> use training_steps_per_round
 train_steps: 500000
-
-# More specific training parameters
-noisy_action_training: True
-noisy_action_experience: True
 
 # Replay buffer / prioritized experience replay
 replay_capacity: 1000000
@@ -111,4 +101,3 @@ momentum: 0.1             # mean update momentum across iterations
 
 seed: 1
 modality: state
-
