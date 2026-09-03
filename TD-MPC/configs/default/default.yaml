@@ -1,16 +1,21 @@
 name: TD-MPC (default)
+device: cuda
 
 # Task parameters
+task: walker-walk        # dm_control domain-task (e.g. cheetah-run, cartpole-swingup, quadruped-run)
+action_repeat: 2         # env steps executed per agent action
 max_episode_length: 600
 image_observations: False
 
 # Training parameters
 training_rounds: 400
 training_steps_per_round: 100   # only used when updates_per_env_step is null
+seed_steps: 5000
 num_episodes_per_round: 3
 eval_policy_every: 5
 seed_episodes: 50               # uniform random-action episodes to seed the buffer
-updates_per_env_step: 1.0       # gradient steps per env step collected (UTD ratio); null -> use training_steps_per_round
+updates_per_env_step: None       # gradient steps per env step collected (UTD ratio); null -> use training_steps_per_round
+train_steps: 500000
 
 # More specific training parameters
 noisy_action_training: True
@@ -20,8 +25,12 @@ noisy_action_experience: True
 replay_capacity: 1000000
 prioritized_replay: False
 per_alpha: 0.6          # prioritization exponent (0 = uniform sampling)
-per_beta_start: 0.4     # importance-sampling correction, annealed to 1.0
+per_beta: 0.4
 per_beta_frames: 200000 # env steps over which beta reaches 1.0
+
+min_std: 0.05
+std_schedule: linear(0.5, 0.05, 25000)   # final == min_std
+horizon_schedule: linear(1, 5, 25000)    # final == horizon
 
 # General Neural Network Training Hyperparameters
 frame_stack: 3
@@ -31,12 +40,11 @@ learning_rate_actor: 1e-4
 batch_size: 512
 latent_dim: 50
 hidden_dim: 256
-gamma: 0.97               # shorter effective horizon -> value target propagates from zero much faster
+gamma: 0.99               # shorter effective horizon -> value target propagates from zero much faster
 time_lambda: 0.5
 reward_loss_weight: 0.5
 value_loss_weight: 0.5
 consistency_loss_weight: 2.0
-terminal_loss_weight: 9.0  # extra weight on horizon steps that end in termination
 
 # Sampling planner
 sampler: MPPI
@@ -68,4 +76,39 @@ CEM:
   num_elites: 64
   # The standard deviation of the Gaussian noise added to the action sequences during sampling
   noise_std: 0.1
+
+# ---------------------------------------------------------------------------
+# Entries consumed by tdmpc.py (the original TDMPC / TOLD implementation).
+# Defaults taken from nicklashansen/tdmpc's config/default.yaml.
+# NOTE: several of these duplicate keys above under different names
+# (discount==gamma, lr==learning_rate, rho==time_lambda,
+#  reward/value/consistency_loss_weight already exist). Kept separate so
+# tdmpc.py runs unmodified; reconcile later if you standardise on one config.
+# ---------------------------------------------------------------------------
+
+# TOLD network architecture
+enc_dim: 256              # hidden width of the state (non-pixel) encoder MLP
+mlp_dim: 512              # hidden width of dynamics / reward / policy / Q MLPs
+num_channels: 32          # conv channels in the pixel encoder
+img_size: 64              # pixel-encoder input resolution (this project resizes frames to 64x64)
+obs_shape: null           # set at runtime by train.py from env.observation_space (e.g. [state_dim])
+
+# Optimisation
+lr: 3e-4                  # Adam learning rate for TOLD + policy
+discount: 0.99            # reward discount factor (gamma)
+rho: 0.5                  # temporal loss decay across the horizon
+grad_clip_norm: 10        # global grad-norm clip
+tau: 0.01                 # target-network EMA coefficient
+update_freq: 2            # env steps between target-network EMA updates
+
+# CEM / MPPI planner (tdmpc.plan)
+iterations: 6             # CEM optimisation iterations
+num_samples: 512          # sampled action trajectories per iteration
+num_elites: 64            # elite trajectories kept per iteration
+mixture_coef: 0.05        # fraction of trajectories seeded from the policy
+temperature: 0.5          # softmax temperature for elite weighting
+momentum: 0.1             # mean update momentum across iterations
+
+seed: 1
+modality: state
 
