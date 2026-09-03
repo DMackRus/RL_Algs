@@ -15,6 +15,8 @@ import yaml
 
 from collections import deque
 
+from dm_control import suite
+
 DEVICE = T.device(
     "cuda" if T.cuda.is_available() else "cpu"
 )
