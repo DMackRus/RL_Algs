@@ -1,6 +1,5 @@
 import os
 
-import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
 import torch as T
@@ -15,8 +14,8 @@ def plot_training(training_file="default/training_stats.npz", window=25):
 
     data = np.load(training_file)
 
-    rewards = data["episode_rewards"]
-    lengths = data["episode_lengths"]
+    rewards = data["training_episode_rewards"]
+    lengths = data["training_episode_lengths"]
 
     def rolling_average(x, window):
         if len(x) < window:
@@ -63,7 +62,7 @@ def plot_training(training_file="default/training_stats.npz", window=25):
 
 def main():
 
-    plot_training("default/training_stats.npz", window=25)
+    plot_training("training_stats.npz", window=25)
 
 if __name__ == "__main__":
     main()

@@ -3,7 +3,8 @@ import torch.nn as nn
 
 from models import RepresentationModel, LatentDynamics, RewardPredictor, ValuePredictor, PolicyModel
 from replay_buffer import ReplayBuffer
-from planner import PredictiveSampler
+from planner import PredictiveSampler, MPPISampler
+from utils import symlog, symexp, make_frame_stacker, process_image, random_shift, update_target_network
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -13,8 +14,6 @@ import os
 import time
 import yaml
 
-from collections import deque
-
 from dm_control import suite
 
 DEVICE = T.device(
@@ -22,66 +21,20 @@ DEVICE = T.device(
 )
 print(f"Using device: {DEVICE}")
 
-def make_frame_stacker(k):
-    frames = deque(maxlen=k)
-    def reset(frame):          # frame: (3, 64, 64)
-        for _ in range(k):
-            frames.append(frame)
-        return T.cat(list(frames), dim=0)   # (3k, 64, 64)
-    def push(frame):
-        frames.append(frame)
-        return T.cat(list(frames), dim=0)
-    return reset, push
-
-def symlog(x):
-    # return x
-    return T.sign(x) * T.log(1 + T.abs(x))
-
-def symexp(x):
-    return T.sign(x) * (T.exp(T.abs(x)) - 1)
-
-def process_image(image):
-    # Resize to 64x64. Keep as uint8 [0, 255] -- normalization to [-1, 1] happens
-    # inside RepresentationModel.forward so the replay buffer can store uint8.
-    image = cv2.resize(image, (64, 64))
-
-    # HWC -> CHW, still uint8
-    image = T.from_numpy(image).permute(2, 0, 1).contiguous()
-
-    return image
-
-def random_shift(imgs, pad=4):
-    """
-    DrQ-style image augmentation: replicate-pad by `pad` pixels on every side,
-    then take a random crop back to the original H x W. One random shift per
-    batch element, shared across all channels / stacked frames.
-
-    imgs: (B, C, H, W), any dtype (H == W). Returns float32, same shape.
-    Applied ONLY during the gradient update -- never during planning.
-    """
-    imgs = imgs.float()
-    b, c, h, w = imgs.shape
-    imgs = T.nn.functional.pad(imgs, (pad, pad, pad, pad), mode="replicate")
-
-    # normalized sampling grid for the un-shifted crop
-    eps = 1.0 / (h + 2 * pad)
-    arange = T.linspace(-1.0 + eps, 1.0 - eps, h + 2 * pad,
-                        device=imgs.device, dtype=imgs.dtype)[:h]
-    arange = arange.unsqueeze(0).repeat(h, 1).unsqueeze(2)
-    base_grid = T.cat([arange, arange.transpose(1, 0)], dim=2)   # (h, w, 2)
-    base_grid = base_grid.unsqueeze(0).repeat(b, 1, 1, 1)        # (b, h, w, 2)
-
-    # random integer pixel shift in [0, 2*pad], expressed in grid units
-    shift = T.randint(0, 2 * pad + 1, size=(b, 1, 1, 2),
-                      device=imgs.device, dtype=imgs.dtype)
-    shift *= 2.0 / (h + 2 * pad)
-
-    grid = base_grid + shift
-    return T.nn.functional.grid_sample(imgs, grid, padding_mode="zeros",
-                                       align_corners=False)
 
 def collect_play_data(env, replay_buffer, representation_model, dynamics_model, reward_model, value_model, policy_model,
-                       config=None, num_episodes=10, noise_std=0.3, train = True, fixed_episode_length=None):
+                       config=None, num_episodes=10, noise_std=0.3, train = True, fixed_episode_length=None,
+                       random_actions=False):
+    """
+    Roll out `num_episodes` episodes and (if train) push transitions to the buffer.
+
+    random_actions:
+        Ignore the planner and sample actions uniformly from the env action space.
+        Used to seed the buffer with diverse, full-amplitude dynamics data before
+        any model has been trained.
+
+    Returns (mean_episode_reward, mean_episode_length).
+    """
 
     if config is None:
         print("No config provided, using default values for horizon and sampling noise.")
@@ -99,17 +52,19 @@ def collect_play_data(env, replay_buffer, representation_model, dynamics_model, 
     with T.no_grad():
         for episode in range(num_episodes):
 
-            # Make a predictive sampler for this episode
-            predictive_sampler = PredictiveSampler(
-                config=config,
-                representation_model=representation_model,
-                dynamics_model=dynamics_model,
-                reward_model=reward_model,
-                value_model=value_model,
-                policy=policy_model,
-                action_dim=env.action_space.shape[0],
-                device=DEVICE,
-            )
+            # Fresh planner per episode (skipped when taking uniform random actions)
+            predictive_sampler = None
+            if not random_actions:
+                predictive_sampler = MPPISampler(
+                    config=config,
+                    representation_model=representation_model,
+                    dynamics_model=dynamics_model,
+                    reward_model=reward_model,
+                    value_model=value_model,
+                    policy=policy_model,
+                    action_dim=env.action_space.shape[0],
+                    device=DEVICE,
+                )
 
             state, info = env.reset()
             total_reward = 0
@@ -123,19 +78,22 @@ def collect_play_data(env, replay_buffer, representation_model, dynamics_model, 
             
             while not done:
 
-                # Handle if the state is a numpy array or a torch tensor
-                if isinstance(state, np.ndarray):
-                    state_tensor = T.from_numpy(state).unsqueeze(0).float().to(DEVICE)
+                if random_actions:
+                    action = env.action_space.sample()
                 else:
-                    state_tensor = state.unsqueeze(0).float().to(DEVICE)
+                    # Handle if the state is a numpy array or a torch tensor
+                    if isinstance(state, np.ndarray):
+                        state_tensor = T.from_numpy(state).unsqueeze(0).float().to(DEVICE)
+                    else:
+                        state_tensor = state.unsqueeze(0).float().to(DEVICE)
 
-                action, _ = predictive_sampler.plan(state_tensor)
-                action = action.squeeze(0).cpu().numpy()
+                    action, _ = predictive_sampler.plan(state_tensor)
+                    action = action.squeeze(0).cpu().numpy()
 
-                if train:
-                    # Add noise to the action for exploration
-                    noise = np.random.normal(0, noise_std, size=action.shape)
-                    action = np.clip(action + noise, -1, 1)
+                    if train:
+                        # Add noise to the action for exploration
+                        noise = np.random.normal(0, noise_std, size=action.shape)
+                        action = np.clip(action + noise, -1, 1)
 
                 next_state, reward, terminated, truncated, info = env.step(action)
                 # print(f"Predicted reward: {predicted['reward'].item():.4f}, Actual reward: {reward:.4f}")
@@ -164,22 +122,15 @@ def collect_play_data(env, replay_buffer, representation_model, dynamics_model, 
 
     return np.mean(rewards), np.mean(episode_lengths)
 
-def update_target_network(epoch, value_predictor, offline_value_predictor, tau=0.005):
-    """
-    Update the offline value predictor using a slow-moving average of the online value predictor.
-    """
-    with T.no_grad():
-        for target_param, param in zip(offline_value_predictor.parameters(), value_predictor.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
 def sample_fixed_eval_batch(replay_buffer, start_index=None):
     """
     Sample a batch from the replay buffer.
     """
     if start_index is not None:
-        states, actions, rewards, next_states, dones = replay_buffer.sample(start_index)
+        states, actions, rewards, next_states, dones, *_ = replay_buffer.sample(start_index)
     else:
-        states, actions, rewards, next_states, dones = replay_buffer.sample()
+        states, actions, rewards, next_states, dones, *_ = replay_buffer.sample()
         
     return {
         "states": states.clone(),
@@ -259,7 +210,7 @@ def testing_run(config_filepath):
 
     latent_dim = config["latent_dim"]
     hidden_dim = config["hidden_dim"]
-    INITIAL_NUM_EPISODES = 10
+    INITIAL_NUM_EPISODES = config.get("seed_episodes", 10)
     EPISODE_LENGTH = config["max_episode_length"]
     IMAGE_OBSERVATIONS = config["image_observations"]
     FRAME_STACK = config.get("frame_stack", 1)
@@ -269,12 +220,16 @@ def testing_run(config_filepath):
     STEPS_PER_ROUND = config["training_steps_per_round"]
     NEW_EPISODES_PER_ROUND = config["num_episodes_per_round"]
     EVAL_EVERY = config["eval_policy_every"]
+    # Gradient steps per round are tied to how many env steps were collected that
+    # round (update-to-data ratio). Set to null/omit to fall back to the fixed
+    # training_steps_per_round.
+    UPDATES_PER_ENV_STEP = config.get("updates_per_env_step", 1.0)
     rho = config["gamma"]
     time_lambda = config["time_lambda"]
 
     # Create the gymnasium environment
-    env = gym.make("LunarLanderContinuous-v3", render_mode="rgb_array")
-    # env = gym.make("Walker2d-v5", render_mode="rgb_array")
+    # env = gym.make("LunarLanderContinuous-v3", render_mode="rgb_array")
+    env = gym.make("Walker2d-v5", render_mode="rgb_array", reset_noise_scale=0.01)
     # env = gym.make("BipedalWalker-v3", render_mode="rgb_array")
     # env = gym.make("dm_control/acrobot-swingup-v0", render_mode="rgb_array") # Doesnt work?
 
@@ -296,8 +251,34 @@ def testing_run(config_filepath):
     value_predictor2 = ValuePredictor(latent_dim, action_dim, hidden_dim).to(DEVICE)
     offline_value_predictor2 = ValuePredictor(latent_dim, action_dim, hidden_dim).to(DEVICE)
 
-    # Instantiate the replay buffer
-    replay_buffer = ReplayBuffer(state_dim, action_dim, image_observations = IMAGE_OBSERVATIONS, horizon=HORIZON, batch_size=config["batch_size"], device=DEVICE)    
+    # Zero-init ONLY the reward head's final layer (reward predictions start at
+    # 0). The Q heads are deliberately left with their default init: with gamma
+    # near 1 the value target has to climb from ~r to ~r/(1-gamma) over many
+    # bootstrap steps, and a zeroed Q head makes that warmup far too slow.
+    reward_predictor.net[-1].weight.data.fill_(0)
+    reward_predictor.net[-1].bias.data.fill_(0)
+
+    # Zero initialise the weights of the Q models and reward model
+    # for model in [value_predictor, offline_value_predictor, value_predictor2, offline_value_predictor2, reward_predictor]:
+    #     for layer in model.modules():
+    #         if isinstance(layer, nn.Linear):
+    #             nn.init.zeros_(layer.weight)
+    #             if layer.bias is not None:
+    #                 nn.init.zeros_(layer.bias)
+
+    # Instantiate the replay buffer (prioritized experience replay by default)
+    replay_buffer = ReplayBuffer(
+        state_dim, action_dim,
+        image_observations=IMAGE_OBSERVATIONS,
+        capacity=config.get("replay_capacity", 100000),
+        horizon=HORIZON,
+        batch_size=config["batch_size"],
+        device=DEVICE,
+        prioritized=config.get("prioritized_replay", True),
+        alpha=config.get("per_alpha", 0.6),
+        beta_start=config.get("per_beta_start", 0.4),
+        beta_frames=config.get("per_beta_frames", 200000),
+    )
 
     optimizer = T.optim.Adam(
         list(representation_model.parameters()) +
@@ -314,17 +295,16 @@ def testing_run(config_filepath):
     offline_representation_model.load_state_dict(representation_model.state_dict()) # TODO - DO we definitely need an offline representation model?
     offline_value_predictor2.load_state_dict(value_predictor2.state_dict())
 
-    # Collect initial data if not already collected
-    # if os.path.exists("initial_data.pkl"):
-    #     print("Loading initial data from file...")
-    #     replay_buffer.load("initial_data.pkl")
-    # else:
-    #     print("Collecting initial data...")
-    avg_reward, avg_episode_length = collect_play_data(env, replay_buffer, representation_model, latent_dynamics, 
+    # Seed the buffer with uniform random actions (full action amplitude) so the
+    # dynamics / reward models see diverse transitions before any planning.
+    avg_reward, avg_episode_length = collect_play_data(env, replay_buffer, representation_model, latent_dynamics,
                                                         reward_predictor, value_predictor, policy_model, config=config,
-                                                        num_episodes=INITIAL_NUM_EPISODES, noise_std=0.3, 
-                                                        train = True, fixed_episode_length=EPISODE_LENGTH)
-    print(f"Average reward from initial data collection: {avg_reward}")
+                                                        num_episodes=INITIAL_NUM_EPISODES, noise_std=0.3,
+                                                        train = True, fixed_episode_length=EPISODE_LENGTH,
+                                                        random_actions=True)
+    seed_env_steps = INITIAL_NUM_EPISODES * avg_episode_length
+    print(f"Seeded replay buffer: {len(replay_buffer)} random-action transitions "
+          f"(avg reward {avg_reward:.2f}, avg episode length {avg_episode_length:.1f})")
         # replay_buffer.save("initial_data.pkl")
 
     training_rewards, training_episode_length = [], []
@@ -334,13 +314,17 @@ def testing_run(config_filepath):
     print("Training starts...")
     for round_idx in range(NUM_TRAINING_ROUNDS):
         avg_reward = 0
-        if round_idx > 0:
+        if round_idx == 0:
+            # Round 0 trains on the random-action seed data only.
+            env_steps_this_round = seed_env_steps
+        else:
 
-            noise_std = get_exploration_std(round_idx, NUM_TRAINING_ROUNDS, std_start=0.5, std_end=0.05, decay_fraction=0.5)
-            avg_reward, avg_episode_length = collect_play_data(env, replay_buffer, representation_model, latent_dynamics, 
+            noise_std = get_exploration_std(round_idx, NUM_TRAINING_ROUNDS, std_start=0.2, std_end=0.05, decay_fraction=0.5)
+            avg_reward, avg_episode_length = collect_play_data(env, replay_buffer, representation_model, latent_dynamics,
                                                             reward_predictor, value_predictor, policy_model, config=config,
-                                                            num_episodes=NEW_EPISODES_PER_ROUND, noise_std=noise_std, 
+                                                            num_episodes=NEW_EPISODES_PER_ROUND, noise_std=noise_std,
                                                             train = True, fixed_episode_length=EPISODE_LENGTH)
+            env_steps_this_round = NEW_EPISODES_PER_ROUND * avg_episode_length
 
             print(f"Round {round_idx}: Average reward over {NEW_EPISODES_PER_ROUND} new episodes: {avg_reward:.2f}, Average episode length: {avg_episode_length:.2f}")
             print(f" Replay buffer size: {len(replay_buffer)}")
@@ -348,20 +332,42 @@ def testing_run(config_filepath):
             training_rewards.append(avg_reward)
             training_episode_length.append(avg_episode_length)
 
-        # How many gradient steps to take per round
-        for epoch in range(STEPS_PER_ROUND):
+        # Gradient steps this round track env steps collected (update-to-data ratio).
+        if UPDATES_PER_ENV_STEP is None:
+            num_updates = STEPS_PER_ROUND
+        else:
+            num_updates = max(1, int(round(UPDATES_PER_ENV_STEP * env_steps_this_round)))
 
-            total_loss, reward_loss, value_loss, consistency_loss, actor_loss, z_norms = update(
+        round_log = {"total": [], "reward": [], "value": [], "consistency": [],
+                     "actor": [], "z_std": [], "q": [], "target": []}
+        for epoch in range(num_updates):
+
+            (total_loss, reward_loss, value_loss, consistency_loss,
+             actor_loss, z_norms, mean_q, mean_target) = update(
                 replay_buffer, representation_model, offline_representation_model,
                 latent_dynamics, reward_predictor, value_predictor, value_predictor2, policy_model,
                 offline_value_predictor, offline_value_predictor2, optimizer, policy_optimizer, global_epoch, config=config,
             )
-            # print(f"Round {round_idx} Epoch {epoch}: Total Loss: {total_loss:.4f}, "
-            #       f"Reward: {reward_loss:.4f}, Value: {value_loss:.4f}, "
-            #       f"Actor: {actor_loss:.4f}, Consistency: {consistency_loss:.4f}, "
-            #       f"Z Norm: {np.mean(z_norms):.4f}")
+            round_log["total"].append(total_loss)
+            round_log["reward"].append(reward_loss)
+            round_log["value"].append(value_loss)
+            round_log["consistency"].append(consistency_loss)
+            round_log["actor"].append(actor_loss if actor_loss is not None else np.nan)
+            # z_norms[0] is a latent norm; z_norms[1:] are per-dim batch stds
+            round_log["z_std"].append(np.mean(z_norms[1:]) if len(z_norms) > 1 else np.nan)
+            round_log["q"].append(mean_q)
+            round_log["target"].append(mean_target)
 
             global_epoch += 1
+
+        print(f"  [train {round_idx}] updates={num_updates} | "
+              f"total {np.mean(round_log['total']):.3f} | "
+              f"reward {np.mean(round_log['reward']):.4f} | "
+              f"value {np.mean(round_log['value']):.3f} | "
+              f"consist {np.mean(round_log['consistency']):.4f} | "
+              f"actor {np.nanmean(round_log['actor']):.3f} | "
+              f"z_std {np.nanmean(round_log['z_std']):.4f} | "
+              f"Q {np.mean(round_log['q']):.2f} vs tgt {np.mean(round_log['target']):.2f}")
 
         if round_idx % EVAL_EVERY == 0:
             # Evaluate the model
@@ -392,9 +398,12 @@ def testing_run(config_filepath):
     )
     env.close()
 
-def update_pi(policy_model, policy_optimizer, value_predictor_1, value_predictor_2, time_lambda, zs):
+def update_pi(policy_model, policy_optimizer, value_predictor_1, value_predictor_2, time_lambda, zs, z_masks=None):
     """
     Update policy using a sequence of latent states.
+
+    z_masks: optional list (same length as zs) of (B,) 0/1 tensors -- latents
+    that come from rolling the dynamics past an episode end are masked out.
     """
 
     actor_loss = 0
@@ -412,9 +421,13 @@ def update_pi(policy_model, policy_optimizer, value_predictor_1, value_predictor
         # noise = (T.randn_like(action) * 0.2).clamp(-0.5, 0.5)
         # action = (action + noise).clamp(-1.0, 1.0)  # match your action bounds
 
-        q = T.min(value_predictor_1(z, action), value_predictor_2(z, action))
+        q = T.min(value_predictor_1(z, action), value_predictor_2(z, action)).squeeze(-1)
 
-        actor_loss += -(time_lambda ** t) * q.mean()
+        if z_masks is not None:
+            m = z_masks[t]
+            actor_loss += -(time_lambda ** t) * (m * q).sum() / m.sum().clamp(min=1.0)
+        else:
+            actor_loss += -(time_lambda ** t) * q.mean()
 
     actor_loss.backward()
     T.nn.utils.clip_grad_norm_(policy_model.parameters(), max_norm=10.0)
@@ -433,17 +446,35 @@ def update(replay_buffer, representation_model, offline_representation_model, la
            offline_value_predictor, offline_value_predictor2,
            optimizer, policy_optimizer, epoch, config=None,
            policy_delay=2, target_noise_std=0.2, target_noise_clip=0.5):
+    """
+    Single update step for the latent dynamics model, reward predictor, value predictor, and policy model.
+
+    Returns:
+        total_loss: Total loss for thje update step
+        reward_loss: Loss for the reward predictor
+        value_loss: Loss for the value predictor
+        consistency_loss: Loss for the latent dynamics model
+        actor_loss: Loss for the policy model
+        z_norms: List of norms of the latent states at each timestep, for monitoring purposes
+    """
 
     if config is None:
-        print("No config provided, using default values for horizon and sampling noise.")
-        return 0, 0, 0, 0, 0, []
+        print("No config provided in update function")
+        return 0, 0, 0, 0, 0, [], 0.0, 0.0
 
     c1, c2, c3 = config["reward_loss_weight"], config["value_loss_weight"], config["consistency_loss_weight"]
     rho = config["gamma"]
     time_lambda = config["time_lambda"]
     H = config["horizon"]
+    # Extra weight on horizon steps that end in termination -- otherwise the
+    # rare "the episode ended here" signal is drowned out and the critic never
+    # learns that falling over is bad.
+    terminal_boost = config.get("terminal_loss_weight", 9.0)
 
-    states, actions, rewards, next_states, dones, terminateds, weights = replay_buffer.sample()
+    # `weights` are the PER importance-sampling corrections (all ones when the
+    # buffer is not prioritized). `masks` is (B, H): 0 for horizon steps that
+    # fall past an episode end (spliced-in next-episode data).
+    states, actions, rewards, next_states, dones, terminateds, weights, masks = replay_buffer.sample()
     # print(f"states shape: {states.shape}")
 
     # DrQ image augmentation -- pixel observations only, gradient update only.
@@ -468,6 +499,12 @@ def update(replay_buffer, representation_model, offline_representation_model, la
     value_loss = 0
     consistency_loss = 0
     td_error_accum = T.zeros(states.shape[0], device=DEVICE)
+    z_masks = [T.ones(states.shape[0], device=DEVICE)]   # zs[0] = enc(s0), always valid
+
+    # running trackers for logging
+    q_sum = 0.0
+    target_sum = 0.0
+    valid_sum = 0.0
 
     for t in range(H):
         reward_pred = reward_predictor(z, actions[:, t]).squeeze(-1)
@@ -502,24 +539,31 @@ def update(replay_buffer, representation_model, offline_representation_model, la
 
         z_norms.append(z.detach().std(dim=0).mean().item())
         zs.append(z.detach())
+        z_masks.append(masks[:, t])
 
-        # Loss terms with bit masking for alive states (i.e. to prevent boundary resets affecting the loss)
-        # reward_loss += (time_lambda ** t) * (alive * (reward_pred - symlog(rewards[:, t])) ** 2).mean()
-        # value_loss  += (time_lambda ** t) * (alive * (value_pred  - symlog(td_target)) ** 2).mean()
-        # value_loss += (time_lambda ** t) * (alive * (value_pred2 - symlog(td_target)) ** 2).mean()
-        # consistency_loss += (time_lambda ** t) * (alive * ((z - latent_state_encoded_next) ** 2).mean(-1)).mean()
+        # m: 1 for real horizon steps, 0 for steps past an episode end.
+        m = masks[:, t]
+        wm = weights * m
+        denom = m.sum().clamp(min=1.0)
 
-        # td_error_accum += (value_pred - symlog(td_target)).detach().abs()
+        # reward + consistency: model-learning losses, discounted over the
+        # horizon because later predictions compound model error.
+        reward_loss += (time_lambda ** t) * (wm * (reward_pred - rewards[:, t]) ** 2).sum() / denom
+        consistency_loss += (time_lambda ** t) * (wm * ((z - latent_state_encoded_next) ** 2).mean(-1)).sum() / denom
 
-        # Huber (smooth L1) on reward/value: MSE-like for |residual| < 1, linear
-        # beyond -- caps gradient magnitude on the large shaping-reward / bootstrap
-        # spikes that otherwise dominate the encoder + dynamics updates.
-        reward_loss += (time_lambda ** t) * T.nn.functional.smooth_l1_loss(reward_pred, rewards[:, t])
-        value_loss  += (time_lambda ** t) * T.nn.functional.smooth_l1_loss(value_pred,  td_target)
-        value_loss  += (time_lambda ** t) * T.nn.functional.smooth_l1_loss(value_pred2, td_target)
-        consistency_loss += (time_lambda ** t) * ((z - latent_state_encoded_next) ** 2).mean(-1).mean()
+        # value: accuracy matters equally at every horizon step for planning, so
+        # it is NOT horizon-discounted; terminal steps are up-weighted so the
+        # "falling ends the episode" signal survives.
+        v_w = 1.0 + terminal_boost * terminateds[:, t].float()
+        value_loss += (wm * v_w * (value_pred  - td_target) ** 2).sum() / denom
+        value_loss += (wm * v_w * (value_pred2 - td_target) ** 2).sum() / denom
 
-        # td_error_accum += (value_pred - td_target).detach().abs()
+        # Accumulate |TD error| per sample (masked) to re-prioritize windows.
+        td_error_accum += m * (value_pred - td_target).detach().abs()
+
+        q_sum += (value_pred.detach() * m).sum().item()
+        target_sum += (td_target * m).sum().item()
+        valid_sum += m.sum().item()
 
     total_loss = (c1 * reward_loss) + (c2 * value_loss) + (c3 * consistency_loss)
     optimizer.zero_grad()
@@ -534,12 +578,13 @@ def update(replay_buffer, representation_model, offline_representation_model, la
     )
     optimizer.step()
 
-    # Update the priorities of the replay buffer based on the TD error
-    # replay_buffer.update_priorities(td_error_accum / H)
+    # Update the priorities of the sampled windows using their mean |TD error|
+    # over the valid (unmasked) horizon steps.
+    replay_buffer.update_priorities(td_error_accum / masks.sum(dim=1).clamp(min=1.0))
 
     # delayed actor update
     actor_loss = None
-    actor_loss = update_pi(policy_model, policy_optimizer, value_predictor, value_predictor2, time_lambda, zs)
+    actor_loss = update_pi(policy_model, policy_optimizer, value_predictor, value_predictor2, time_lambda, zs, z_masks)
     if epoch % policy_delay == 0:
         
         update_target_network(epoch, value_predictor, offline_value_predictor, tau=0.005)
@@ -547,157 +592,14 @@ def update(replay_buffer, representation_model, offline_representation_model, la
         # update_target_network(epoch, representation_model, offline_representation_model, tau=0.005)
             
 
+    mean_q = q_sum / max(valid_sum, 1.0)
+    mean_target = target_sum / max(valid_sum, 1.0)
+
     return (total_loss.item(), reward_loss.item(), value_loss.item(),
-            consistency_loss.item(), actor_loss, z_norms)
-
-
-def overfit_batch_test(config_filepath, num_steps=3000, log_every=50, num_collect_episodes=8):
-    """
-    Diagnostic: can the world model (encoder + latent dynamics + reward/value
-    heads) *overfit a single fixed batch* of trajectories?
-
-    Trains only the world-model losses -- reward, consistency, and value against
-    a STATIONARY Monte-Carlo target (no bootstrap, no target networks, no policy,
-    no augmentation) -- on one frozen batch for `num_steps` gradient steps.
-
-    Reading the result:
-      * reward loss and consistency loss should fall by 1-2+ orders of magnitude
-        and keep dropping. That means the pipeline is correct and the encoder
-        input carries the needed information -> your real problem is RL / data
-        (exploration, tiny all-crash buffer, too many grad steps per round).
-      * If they plateau high, the model cannot fit even data it sees every step
-        -> the encoder input lacks the signal (image resolution / observation),
-        or there is a wiring bug. More training episodes will NOT help.
-    """
-    folder_path = os.path.dirname(config_filepath)
-    with open(config_filepath, "r") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
-
-    latent_dim = config["latent_dim"]
-    hidden_dim = config["hidden_dim"]
-    IMAGE = config["image_observations"]
-    FRAME_STACK = config.get("frame_stack", 1)
-    H = config["horizon"]
-    rho = config["gamma"]
-    time_lambda = config["time_lambda"]
-
-    env = gym.make("LunarLanderContinuous-v3", render_mode="rgb_array")
-    if IMAGE:
-        state_dim = (3 * FRAME_STACK, 64, 64)
-    else:
-        state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.shape[0]
-
-    representation_model = RepresentationModel(latent_dim, state_dim, hidden_dim,
-                                              image_state=IMAGE, frame_stack=FRAME_STACK).to(DEVICE)
-    latent_dynamics = LatentDynamics(latent_dim, action_dim, hidden_dim).to(DEVICE)
-    reward_predictor = RewardPredictor(latent_dim, action_dim, hidden_dim).to(DEVICE)
-    value_predictor = ValuePredictor(latent_dim, action_dim, hidden_dim).to(DEVICE)
-    policy_model = PolicyModel(latent_dim, action_dim, hidden_dim).to(DEVICE)  # only used to drive data collection
-
-    replay_buffer = ReplayBuffer(state_dim, action_dim, image_observations=IMAGE, horizon=H,
-                                 batch_size=config["batch_size"], device=DEVICE)
-
-    # --- collect a little data (untrained planner + noise -> varied trajectories) ---
-    print(f"Collecting {num_collect_episodes} episodes for the overfit test...")
-    collect_play_data(env, replay_buffer, representation_model, latent_dynamics, reward_predictor,
-                      value_predictor, policy_model, config=config, num_episodes=num_collect_episodes,
-                      noise_std=0.5, train=True, fixed_episode_length=config["max_episode_length"])
-    print(f"Buffer size: {len(replay_buffer)}")
-
-    # --- freeze ONE batch ---
-    states, actions, rewards, next_states, dones, terminateds, weights = replay_buffer.sample()
-    states = states.clone()
-    actions = actions.clone()
-    rewards = rewards.clone()
-    next_states = next_states.clone()
-
-    # stationary Monte-Carlo return target over the horizon window (no bootstrap)
-    with T.no_grad():
-        mc_target = T.zeros_like(rewards)
-        running = T.zeros(rewards.shape[0], device=DEVICE)
-        for t in reversed(range(H)):
-            running = rewards[:, t] + rho * running
-            mc_target[:, t] = running
-
-    opt = T.optim.Adam(
-        list(representation_model.parameters()) +
-        list(latent_dynamics.parameters()) +
-        list(reward_predictor.parameters()) +
-        list(value_predictor.parameters()),
-        lr=float(config["learning_rate"]))
-
-    for m in (representation_model, latent_dynamics, reward_predictor, value_predictor):
-        m.train()
-
-    hist = {"step": [], "reward": [], "value": [], "consistency": [], "z_std": []}
-
-    for step in range(num_steps):
-        z = representation_model(states[:, 0])
-        reward_loss = 0.0
-        value_loss = 0.0
-        consistency_loss = 0.0
-        for t in range(H):
-            reward_pred = reward_predictor(z, actions[:, t]).squeeze(-1)
-            value_pred = value_predictor(z, actions[:, t]).squeeze(-1)
-            z = latent_dynamics(z, actions[:, t])
-            with T.no_grad():
-                z_next = representation_model(next_states[:, t])
-            reward_loss += (time_lambda ** t) * T.nn.functional.smooth_l1_loss(reward_pred, rewards[:, t])
-            value_loss += (time_lambda ** t) * T.nn.functional.smooth_l1_loss(value_pred, mc_target[:, t])
-            consistency_loss += (time_lambda ** t) * ((z - z_next) ** 2).mean(-1).mean()
-
-        loss = reward_loss + value_loss + consistency_loss
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-
-        if step % log_every == 0:
-            with T.no_grad():
-                z_std = representation_model(states[:, 0]).std(dim=0).mean().item()
-            hist["step"].append(step)
-            hist["reward"].append(reward_loss.item())
-            hist["value"].append(value_loss.item())
-            hist["consistency"].append(consistency_loss.item())
-            hist["z_std"].append(z_std)
-            print(f"step {step:5d} | reward {reward_loss.item():9.4f} | "
-                  f"value {value_loss.item():10.4f} | consistency {consistency_loss.item():9.5f} | "
-                  f"z.std {z_std:.3f}")
-
-    r0, rN = hist["reward"][0], hist["reward"][-1]
-    c0, cN = hist["consistency"][0], hist["consistency"][-1]
-    print(f"\nreward loss:      {r0:.4f} -> {rN:.4f}  ({r0 / max(rN, 1e-9):.1f}x reduction)")
-    print(f"consistency loss: {c0:.5f} -> {cN:.5f}  ({c0 / max(cN, 1e-9):.1f}x reduction)")
-    print("PASS (pipeline OK, info present) if both drop >~20x and are still trending down.")
-    print("FAIL (info/wiring problem) if they plateau after an initial dip.")
-
-    try:
-        plt.switch_backend("Agg")
-        fig, ax = plt.subplots(1, 3, figsize=(15, 4))
-        for a, key, title in zip(ax, ("reward", "value", "consistency"),
-                                 ("reward loss", "value loss (fixed MC target)", "consistency loss")):
-            a.plot(hist["step"], hist[key])
-            a.set_title(title)
-            a.set_xlabel("gradient step")
-            a.set_yscale("log")
-        fig.suptitle(f"Overfit-one-batch test ({'image' if IMAGE else 'state'} obs)")
-        fig.tight_layout()
-        out_path = f"{folder_path}/overfit_test.png"
-        fig.savefig(out_path, dpi=120)
-        print(f"Saved loss curves to {out_path}")
-    except Exception as e:
-        print(f"(plot skipped: {e})")
-
-    env.close()
+            consistency_loss.item(), actor_loss, z_norms, mean_q, mean_target)
 
 
 if __name__ == "__main__":
-
-    # Diagnostic: can the world model overfit a single fixed batch?
-    # overfit_batch_test("configs/default/default.yaml", num_steps=3000)
-
-    #Just a single testing run
-    # testing_run("configs/default/default.yaml")
 
     #Just a single testing run
     testing_run("configs/default/default.yaml")
