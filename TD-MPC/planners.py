@@ -1,7 +1,6 @@
 import numpy as np
 import torch as T
 
-
 class LatentPlanner:
     """
     Shared machinery for sampling-based planners that optimise an action
@@ -113,7 +112,6 @@ class LatentPlanner:
         shifted[-1] = self.model.pi(z0, self.min_std).squeeze(0)
         self.nominal_actions = shifted
 
-
 class MPPISampler(LatentPlanner):
 
     def __init__(
@@ -209,7 +207,6 @@ class MPPISampler(LatentPlanner):
             self._warm_start(self.nominal_actions, z0)
 
             return action, value
-
 
 class CEMPlanner(LatentPlanner):
 

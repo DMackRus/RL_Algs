@@ -10,14 +10,14 @@ image_observations: False
 seed_steps: 5000    #was 5000
 eval_policy_every: 5
 eval_episodes: 10
-train_steps: 500000
+train_steps: 40000
 
 # Replay buffer / prioritized experience replay
 replay_capacity: 1000000
 prioritized_replay: False
 per_alpha: 0.6          # prioritization exponent (0 = uniform sampling)
 per_beta: 0.4
-per_beta_frames: 50000 # env steps over which beta reaches 1.0
+per_beta_frames: 200000 # env steps over which beta reaches 1.0
 
 min_std: 0.05
 std_schedule: linear(0.5, 0.05, 25000)   # final == min_std

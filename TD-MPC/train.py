@@ -206,12 +206,17 @@ def testing_run(config_filepath):
         episode_idx += 1
 
     logger.save()
-    env.close()
+    # env.close()
 
 if __name__ == "__main__":
 
+    # Testing adaptive timestep size
+    testing_run("configs/fixed_versus_adaptive/adaptive_dt/config.yaml")
+    # Testing non adaptive timestep size
+    # testing_run("configs/fixed_versus_adaptive/fixed_dt/config.yaml")
+
     #Just a single testing run
-    testing_run("configs/default/default.yaml")
+    # testing_run("configs/default/default.yaml")
 
     # # test_name = "testing_horizons"
     # test_name = "testing_time_lambdas"
