@@ -4,6 +4,7 @@ import torch.nn as nn
 from copy import deepcopy
 from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
+from planners import PredictiveSampler, MPPISampler, CEMPlanner
 
 import utils
 
@@ -91,9 +92,16 @@ class TOLD(nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
+		# When condition_dt is set, the dynamics + reward heads take an extra
+		# scalar input: the physical timestep Delta t (seconds) that a single
+		# model step should advance. Lets one model roll out at variable step
+		# sizes. Disabled by default so old checkpoints load unchanged.
+		self.cond_dt = bool(cfg.get("condition_dt", False))
+		self.dt_scale = float(cfg.get("dt_scale", 1.0))   # feature = dt * dt_scale
+		dt_extra = 1 if self.cond_dt else 0
 		self._encoder = enc(cfg)
-		self._dynamics = mlp(cfg["latent_dim"]+cfg["action_dim"], cfg["mlp_dim"], cfg["latent_dim"])
-		self._reward = mlp(cfg["latent_dim"]+cfg["action_dim"], cfg["mlp_dim"], 1)
+		self._dynamics = mlp(cfg["latent_dim"]+cfg["action_dim"]+dt_extra, cfg["mlp_dim"], cfg["latent_dim"])
+		self._reward = mlp(cfg["latent_dim"]+cfg["action_dim"]+dt_extra, cfg["mlp_dim"], 1)
 		self._pi = mlp(cfg["latent_dim"], cfg["mlp_dim"], cfg["action_dim"])
 		self._Q1, self._Q2 = q(cfg), q(cfg)
 		self.apply(utils.orthogonal_init)
@@ -110,9 +118,36 @@ class TOLD(nn.Module):
 		"""Encodes an observation into its latent representation (h)."""
 		return self._encoder(obs)
 
-	def next(self, z, a):
-		"""Predicts next latent state (d) and single-step reward (R)."""
-		x = torch.cat([z, a], dim=-1)
+	def _dt_feat(self, dt, ref):
+		"""Build the (B, 1) Delta t conditioning feature, or None when disabled.
+
+		dt may be a python scalar or a tensor broadcastable to (B, 1); it is the
+		physical timestep in seconds. ref is any (B, ...) tensor used for batch
+		size / device / dtype.
+		"""
+		if not self.cond_dt:
+			return None
+		if not torch.is_tensor(dt):
+			dt = torch.full((ref.shape[0], 1), float(dt), device=ref.device, dtype=ref.dtype)
+		else:
+			dt = dt.to(device=ref.device, dtype=ref.dtype).reshape(-1, 1).expand(ref.shape[0], 1)
+		return dt * self.dt_scale
+
+	def next(self, z, a, dt=None):
+		"""Predicts next latent state (d) and reward (R).
+
+		dt: physical timestep (seconds) the step advances. Required when
+		cfg['condition_dt'] is set; ignored otherwise. When conditioned, the
+		reward head predicts the return accumulated over that interval, not a
+		single-step reward.
+		"""
+		if self.cond_dt and dt is None:
+			raise ValueError("TOLD.next requires dt when cfg['condition_dt'] is set")
+		feats = [z, a]
+		dt_feat = self._dt_feat(dt, z)
+		if dt_feat is not None:
+			feats.append(dt_feat)
+		x = torch.cat(feats, dim=-1)
 		return self._dynamics(x), self._reward(x)
 
 	def pi(self, z, std=0):
@@ -139,6 +174,8 @@ class TDMPC():
 		self.optim = torch.optim.Adam(self.model.parameters(), lr=float(self.cfg["lr"]))
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=float(self.cfg["lr"]))
 		self.aug = utils.RandomShiftsAug(cfg)
+		self.planner = CEMPlanner(self.cfg, self.model)
+		# self.planner = MPPISampler(self.cfg, self.model)
 		self.model.eval()
 		self.model_target.eval()
 
@@ -157,16 +194,25 @@ class TDMPC():
 		self.model.load_state_dict(d['model'])
 		self.model_target.load_state_dict(d['model_target'])
 
-	@torch.no_grad()
-	def estimate_value(self, z, actions, horizon):
-		"""Estimate value of a trajectory starting at latent state z and executing given actions."""
-		G, discount = 0, 1
-		for t in range(horizon):
-			z, reward = self.model.next(z, actions[t])
-			G += discount * reward
-			discount *= self.cfg["discount"]
-		G += discount * torch.min(*self.model.Q(z, self.model.pi(z, self.cfg["min_std"])))
-		return G
+	def _macro_dt(self, k):
+		"""Physical Delta t (seconds) for a macro-step spanning k base env steps.
+		Returns None when the model is not Delta t-conditioned (k is then always 1
+		and every code path below reduces to the original single-step behaviour)."""
+		return k * float(self.cfg["dt_base"]) if self.model.cond_dt else None
+
+	# @torch.no_grad()
+	# def estimate_value(self, z, actions, horizon, k=1):
+	# 	"""Estimate value of a trajectory starting at latent state z and executing
+	# 	given actions. Each model step advances k base env steps (k=1 == original)."""
+	# 	G, discount = 0, 1
+	# 	dt = self._macro_dt(k)
+	# 	gamma_k = self.cfg["discount"] ** k
+	# 	for t in range(horizon):
+	# 		z, reward = self.model.next(z, actions[t], dt)
+	# 		G += discount * reward
+	# 		discount *= gamma_k
+	# 	G += discount * torch.min(*self.model.Q(z, self.model.pi(z, self.cfg["min_std"])))
+	# 	return G
 
 	@torch.no_grad()
 	def plan(self, obs, eval_mode=False, step=None, t0=True):
@@ -177,58 +223,67 @@ class TDMPC():
 		step: current time step. determines e.g. planning horizon.
 		t0: whether current step is the first step of an episode.
 		"""
-		# Seed steps
+		# Seed steps - perform random actions to fill replay buffer initially.
 		if step < self.cfg["seed_steps"] and not eval_mode:
 			return torch.empty(self.cfg["action_dim"], dtype=torch.float32, device=self.device).uniform_(-1, 1)
 
-		# Sample policy trajectories
 		obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-		horizon = int(min(self.cfg["horizon"], utils.linear_schedule(self.cfg["horizon_schedule"], step)))
-		num_pi_trajs = int(self.cfg["mixture_coef"] * self.cfg["num_samples"])
-		if num_pi_trajs > 0:
-			pi_actions = torch.empty(horizon, num_pi_trajs, self.cfg["action_dim"], device=self.device)
-			z = self.model.h(obs).repeat(num_pi_trajs, 1)
-			for t in range(horizon):
-				pi_actions[t] = self.model.pi(z, self.cfg["min_std"])
-				z, _ = self.model.next(z, pi_actions[t])
+		action, _ = self.planner.plan(obs, t0=t0)
+		return action
 
-		# Initialize state and parameters
-		z = self.model.h(obs).repeat(self.cfg["num_samples"]+num_pi_trajs, 1)
-		mean = torch.zeros(horizon, self.cfg["action_dim"], device=self.device)
-		std = 2*torch.ones(horizon, self.cfg["action_dim"], device=self.device)
-		if not t0 and hasattr(self, '_prev_mean'):
-			mean[:-1] = self._prev_mean[1:]
+		# ------------ Previous CEM code for planning in latent space ---------------
+		# Sample policy trajectories
+		# obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+		# horizon = int(min(self.cfg["horizon"], utils.linear_schedule(self.cfg["horizon_schedule"], step)))
+		# # Planner rolls out at a fixed macro-step size (plan_k base env steps per
+		# # model step); the effective lookahead is horizon * k base steps.
+		# k = int(self.cfg.get("plan_k", 1)) if self.model.cond_dt else 1
+		# dt = self._macro_dt(k)
+		# num_pi_trajs = int(self.cfg["mixture_coef"] * self.cfg["num_samples"])
+		# if num_pi_trajs > 0:
+		# 	pi_actions = torch.empty(horizon, num_pi_trajs, self.cfg["action_dim"], device=self.device)
+		# 	z = self.model.h(obs).repeat(num_pi_trajs, 1)
+		# 	for t in range(horizon):
+		# 		pi_actions[t] = self.model.pi(z, self.cfg["min_std"])
+		# 		z, _ = self.model.next(z, pi_actions[t], dt)
 
-		# Iterate CEM
-		for i in range(self.cfg["iterations"]):
-			actions = torch.clamp(mean.unsqueeze(1) + std.unsqueeze(1) * \
-				torch.randn(horizon, self.cfg["num_samples"], self.cfg["action_dim"], device=std.device), -1, 1)
-			if num_pi_trajs > 0:
-				actions = torch.cat([actions, pi_actions], dim=1)
+		# # Initialize state and parameters
+		# z = self.model.h(obs).repeat(self.cfg["num_samples"]+num_pi_trajs, 1)
+		# mean = torch.zeros(horizon, self.cfg["action_dim"], device=self.device)
+		# std = 2*torch.ones(horizon, self.cfg["action_dim"], device=self.device)
+		# if not t0 and hasattr(self, '_prev_mean'):
+		# 	mean[:-1] = self._prev_mean[1:]
 
-			# Compute elite actions
-			value = self.estimate_value(z, actions, horizon).nan_to_num_(0)
-			elite_idxs = torch.topk(value.squeeze(1), self.cfg["num_elites"], dim=0).indices
-			elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
+		# # Iterate CEM
+		# for i in range(self.cfg["iterations"]):
+		# 	actions = torch.clamp(mean.unsqueeze(1) + std.unsqueeze(1) * \
+		# 		torch.randn(horizon, self.cfg["num_samples"], self.cfg["action_dim"], device=std.device), -1, 1)
+		# 	if num_pi_trajs > 0:
+		# 		actions = torch.cat([actions, pi_actions], dim=1)
 
-			# Update parameters
-			max_value = elite_value.max(0)[0]
-			score = torch.exp(self.cfg["temperature"]*(elite_value - max_value))
-			score /= score.sum(0)
-			_mean = torch.sum(score.unsqueeze(0) * elite_actions, dim=1) / (score.sum(0) + 1e-9)
-			_std = torch.sqrt(torch.sum(score.unsqueeze(0) * (elite_actions - _mean.unsqueeze(1)) ** 2, dim=1) / (score.sum(0) + 1e-9))
-			_std = _std.clamp_(self.std, 2)
-			mean, std = self.cfg["momentum"] * mean + (1 - self.cfg["momentum"]) * _mean, _std
+		# 	# Compute elite actions
+		# 	value = self.estimate_value(z, actions, horizon, k).nan_to_num_(0)
+		# 	elite_idxs = torch.topk(value.squeeze(1), self.cfg["num_elites"], dim=0).indices
+		# 	elite_value, elite_actions = value[elite_idxs], actions[:, elite_idxs]
 
-		# Outputs
-		score = score.squeeze(1).cpu().numpy()
-		actions = elite_actions[:, np.random.choice(np.arange(score.shape[0]), p=score)]
-		self._prev_mean = mean
-		mean, std = actions[0], _std[0]
-		a = mean
-		if not eval_mode:
-			a += std * torch.randn(self.cfg["action_dim"], device=std.device)
-		return a
+		# 	# Update parameters
+		# 	max_value = elite_value.max(0)[0]
+		# 	score = torch.exp(self.cfg["temperature"]*(elite_value - max_value))
+		# 	score /= score.sum(0)
+		# 	_mean = torch.sum(score.unsqueeze(0) * elite_actions, dim=1) / (score.sum(0) + 1e-9)
+		# 	_std = torch.sqrt(torch.sum(score.unsqueeze(0) * (elite_actions - _mean.unsqueeze(1)) ** 2, dim=1) / (score.sum(0) + 1e-9))
+		# 	_std = _std.clamp_(self.std, 2)
+		# 	mean, std = self.cfg["momentum"] * mean + (1 - self.cfg["momentum"]) * _mean, _std
+
+		# # Outputs
+		# score = score.squeeze(1).cpu().numpy()
+		# actions = elite_actions[:, np.random.choice(np.arange(score.shape[0]), p=score)]
+		# self._prev_mean = mean
+		# mean, std = actions[0], _std[0]
+		# a = mean
+		# if not eval_mode:
+		# 	a += std * torch.randn(self.cfg["action_dim"], device=std.device)
+		# return a
 
 	def update_pi(self, zs):
 		"""Update policy using a sequence of latent states."""
@@ -249,16 +304,19 @@ class TDMPC():
 		return pi_loss.item()
 
 	@torch.no_grad()
-	def _td_target(self, next_obs, reward):
-		"""Compute the TD-target from a reward and the observation at the following time step."""
+	def _td_target(self, next_obs, reward, k=1):
+		"""Compute the TD-target from a (k-step) reward and the observation k base
+		steps later. reward is the discounted return over the macro-step, so the
+		bootstrap term is discounted by gamma**k."""
 		next_z = self.model.h(next_obs)
-		td_target = reward + self.cfg["discount"] * \
+		td_target = reward + (self.cfg["discount"] ** k) * \
 			torch.min(*self.model_target.Q(next_z, self.model.pi(next_z, self.cfg["min_std"])))
 		return td_target
 
 	def update(self, replay_buffer, step):
 		"""Main update function. Corresponds to one iteration of the TOLD model learning."""
-		obs, next_obses, action, reward, idxs, weights = replay_buffer.sample()
+		obs, next_obses, action, reward, idxs, weights, k = replay_buffer.sample()
+		dt = self._macro_dt(k)
 		self.optim.zero_grad(set_to_none=True)
 		self.std = utils.linear_schedule(self.cfg["std_schedule"], step)
 		self.model.train()
@@ -272,11 +330,11 @@ class TDMPC():
 
 			# Predictions
 			Q1, Q2 = self.model.Q(z, action[t])
-			z, reward_pred = self.model.next(z, action[t])
+			z, reward_pred = self.model.next(z, action[t], dt)
 			with torch.no_grad():
 				next_obs = self.aug(next_obses[t])
 				next_z = self.model_target.h(next_obs)
-				td_target = self._td_target(next_obs, reward[t])
+				td_target = self._td_target(next_obs, reward[t], k)
 			zs.append(z.detach())
 
 			# Losses

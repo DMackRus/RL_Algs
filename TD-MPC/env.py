@@ -270,6 +270,9 @@ def make_env(cfg):
 					 task,
 					 task_kwargs={'random': cfg["seed"]},
 					 visualize_reward=False)
+	# Physical seconds advanced per agent action (control step * action repeat).
+	# Used as the base unit for Delta t conditioning.
+	cfg["dt_base"] = float(env.control_timestep()) * cfg["action_repeat"]
 	env = ActionDTypeWrapper(env, np.float32)
 	env = ActionRepeatWrapper(env, cfg["action_repeat"])
 	env = action_scale.Wrapper(env, minimum=-1.0, maximum=+1.0)

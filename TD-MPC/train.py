@@ -1,12 +1,6 @@
 import torch as T
 import torch.nn as nn
 
-from models import RepresentationModel, LatentDynamics, RewardPredictor, ValuePredictor, PolicyModel
-from replay_buffer import ReplayBuffer, Episode
-from planner import PredictiveSampler, MPPISampler
-from utils import symlog, symexp, make_frame_stacker, process_image
-from env import make_env
-
 import matplotlib.pyplot as plt
 import numpy as np
 import cv2
@@ -15,6 +9,9 @@ import time
 import yaml
 from collections import defaultdict
 
+from replay_buffer import ReplayBuffer, Episode
+from utils import symlog, symexp, make_frame_stacker, process_image
+from env import make_env
 from tdmpc import TDMPC
 
 class Logger:
