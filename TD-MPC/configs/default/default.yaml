@@ -9,6 +9,7 @@ image_observations: False
 # Training parameters
 seed_steps: 5000
 eval_policy_every: 5
+eval_episodes: 10
 train_steps: 500000
 
 # Replay buffer / prioritized experience replay

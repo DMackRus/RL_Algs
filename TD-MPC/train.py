@@ -13,8 +13,121 @@ import cv2
 import os
 import time
 import yaml
+from collections import defaultdict
 
 from tdmpc import TDMPC
+
+class Logger:
+    """Collects per-iteration training / evaluation rewards and update metrics.
+
+    One "iteration" is one pass of the outer loop in ``testing_run``: collect a
+    single episode, then run a batch of model updates. Evaluation is only run
+    every few iterations (``eval_policy_every``); on the iterations in between
+    we repeat the most recent eval score so the eval arrays line up 1:1 with the
+    training arrays and can be plotted against a shared x-axis without any
+    bookkeeping.
+
+    Outputs (both written to ``work_dir``):
+      - ``log.txt``            human-readable, one row per iteration
+      - ``training_stats.npz`` all history as numpy arrays for offline plotting
+    """
+
+    def __init__(self, work_dir, cfg):
+        self.work_dir = work_dir
+        self.cfg = cfg
+        os.makedirs(work_dir, exist_ok=True)
+        self.log_file = os.path.join(work_dir, "log.txt")
+
+        # Per-iteration history (all lists stay the same length).
+        self.iterations = []
+        self.steps = []
+        self.elapsed = []
+        self.train_rewards = []
+        self.train_lengths = []
+        self.eval_rewards = []
+        self.eval_lengths = []
+        self.metrics = defaultdict(list)   # update-metric name -> per-iteration value
+
+        # Most recent evaluation result, carried forward between eval runs.
+        self._last_eval_reward = float("nan")
+        self._last_eval_length = float("nan")
+
+        self.start_time = time.time()
+
+    def set_eval(self, reward, length):
+        """Record a fresh evaluation result. Call on eval iterations only; the
+        value is then repeated on every following iteration until the next call."""
+        self._last_eval_reward = float(reward)
+        self._last_eval_length = float(length)
+
+    def log_iteration(self, iteration, step, episode, train_metrics):
+        """Store everything for one outer training-loop iteration."""
+        n = len(self.iterations)
+
+        self.iterations.append(int(iteration))
+        self.steps.append(int(step))
+        self.elapsed.append(time.time() - self.start_time)
+        self.train_rewards.append(float(episode.cumulative_reward))
+        self.train_lengths.append(int(len(episode)))
+
+        # Repeat the latest eval score so eval arrays align with training arrays.
+        self.eval_rewards.append(self._last_eval_reward)
+        self.eval_lengths.append(self._last_eval_length)
+
+        # Update metrics. ``train_metrics`` is empty during the seed phase, and a
+        # metric first seen mid-run is back-filled with NaN for earlier rows.
+        for key in set(self.metrics) | set(train_metrics):
+            col = self.metrics[key]
+            col.extend([float("nan")] * (n - len(col)))
+            col.append(float(train_metrics.get(key, float("nan"))))
+
+        self._write_log()
+
+    def _write_log(self):
+        metric_keys = sorted(self.metrics)
+        cols = ["iter", "step", "elapsed_s", "train_reward", "train_length",
+                "eval_reward", "eval_length"] + metric_keys
+        lines = ["\t".join(cols)]
+        for i in range(len(self.iterations)):
+            row = [self.iterations[i], self.steps[i], f"{self.elapsed[i]:.1f}",
+                   f"{self.train_rewards[i]:.2f}", self.train_lengths[i],
+                   f"{self.eval_rewards[i]:.2f}", f"{self.eval_lengths[i]:.1f}"]
+            row += [f"{self.metrics[k][i]:.4f}" for k in metric_keys]
+            lines.append("\t".join(str(x) for x in row))
+        with open(self.log_file, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def save(self, filename="training_stats.npz"):
+        """Dump all collected history to a ``.npz`` for offline plotting."""
+        arrays = dict(
+            iterations=np.array(self.iterations),
+            steps=np.array(self.steps),
+            elapsed_seconds=np.array(self.elapsed),
+            training_episode_rewards=np.array(self.train_rewards),
+            training_episode_lengths=np.array(self.train_lengths),
+            evaluation_episode_rewards=np.array(self.eval_rewards),
+            evaluation_episode_lengths=np.array(self.eval_lengths),
+        )
+        for key, values in self.metrics.items():
+            arrays[f"metric_{key}"] = np.array(values)
+        np.savez(os.path.join(self.work_dir, filename), **arrays)
+
+
+@T.no_grad()
+def evaluate(env, agent, num_episodes, step):
+    """Run ``num_episodes`` noise-free planning rollouts and return the mean
+    cumulative reward and mean episode length."""
+    rewards, lengths = [], []
+    for _ in range(num_episodes):
+        obs, done, ep_reward, t = env.reset(), False, 0.0, 0
+        while not done:
+            action = agent.plan(obs, eval_mode=True, step=step, t0=(t == 0))
+            obs, reward, done, _ = env.step(action.cpu().numpy())
+            ep_reward += reward
+            t += 1
+        rewards.append(ep_reward)
+        lengths.append(t)
+    return float(np.mean(rewards)), float(np.mean(lengths))
 
 def testing_run(config_filepath):
 
@@ -26,7 +139,8 @@ def testing_run(config_filepath):
     IMAGE_OBSERVATIONS = config["image_observations"]
     FRAME_STACK = config.get("frame_stack", 1)
     SAMPLING_NOISE_STD = config["sampling_noise"]
-    EVAL_EVERY = config["eval_policy_every"]
+    EVAL_EVERY = config["eval_policy_every"]          # eval once every N iterations
+    EVAL_EPISODES = config.get("eval_episodes", 5)    # rollouts averaged per eval
 
     # Create the dm_control environment (task / action_repeat set in the config).
     env = make_env(config)
@@ -40,8 +154,10 @@ def testing_run(config_filepath):
 
     config["action_dim"] = action_dim
     config["state_dim"] = state_dim
-    # TODO - hardcoded - needs updating based on env
-    config["episode_length"] = 500
+    config["episode_length"] = env.ep_len
+
+    print(f"Env control timestep: {env.unwrapped.control_timestep()}")
+    print(f"Env episode length: {config['episode_length']}")
 
     # Make a TDMPC object
     tdmpc = TDMPC(config)
@@ -51,13 +167,10 @@ def testing_run(config_filepath):
         config
     )
 
-    training_rewards, training_episode_length = [], []
-    evaluation_rewards, evaluation_episode_length = [], []
+    logger = Logger(folder_path, config)
 
-    global_epoch = 0
-    step = 0
     print("Training starts...")
-    episode_idx, start_time = 0, time.time()
+    episode_idx = 0
     for step in range(0, config["train_steps"]+config["episode_length"], config["episode_length"]):
 
         obs = env.reset()
@@ -78,39 +191,24 @@ def testing_run(config_filepath):
             for i in range(num_updates):
                 train_metrics.update(tdmpc.update(replay_buffer, step+i))
 
-        # Save training episode metrics
+        # Evaluate the current policy periodically (noise-free planning). The
+        # score is carried forward by the logger onto the intervening iterations.
+        if step >= config["seed_steps"] and episode_idx % EVAL_EVERY == 0:
+            eval_reward, eval_length = evaluate(env, tdmpc, EVAL_EPISODES, step)
+            print(f"Step {step}: eval reward over {EVAL_EPISODES} episodes: {eval_reward:.2f}")
+            logger.set_eval(eval_reward, eval_length)
+
+            os.makedirs(f"{folder_path}/model_checkpoints", exist_ok=True)
+            tdmpc.save(f"{folder_path}/model_checkpoints/checkpoint_step{step}.pt")
+
+        # Record this iteration: training reward/length, carried-forward eval
+        # reward/length, and the latest update metrics (NaN during seed phase).
+        logger.log_iteration(episode_idx, step, episode, train_metrics)
+        logger.save()
+
         episode_idx += 1
 
-
-        # Evaluate the models periodically
-        # if round_idx % EVAL_EVERY == 0:
-        #     # Evaluate the model
-        #     episode = collect_play_data(env, tdmpc, replay_buffer,
-        #                     config=config, num_episodes=5, noise_std=0.0, train = False, fixed_episode_length=EPISODE_LENGTH)
-        #     print(f"Round {round_idx}: Average reward over 5 evaluation episodes: {eval_score:.2f}")
-        #     evaluation_rewards.append(eval_score)
-        #     evaluation_episode_length.append(avg_episode_length)
-
-        #     if os.path.exists(f"{folder_path}/model_checkpoints") == False:
-        #         os.makedirs(f"{folder_path}/model_checkpoints")
-        #     T.save({
-        #         "representation_model": representation_model.state_dict(),
-        #         "latent_dynamics": latent_dynamics.state_dict(),
-        #         "reward_predictor": reward_predictor.state_dict(),
-        #         "value_predictor": value_predictor.state_dict(),
-        #         "policy_model": policy_model.state_dict(),
-        #     }, f"{folder_path}/model_checkpoints/checkpoint_round{round_idx}.pt")
-
-        #     global_epoch += 1
-
-    # Save training data
-    np.savez(
-        f"{folder_path}/training_stats.npz",
-        training_episode_rewards=np.array(training_rewards),
-        training_episode_lengths=np.array(training_episode_length),
-        evaluation_episode_rewards=np.array(evaluation_rewards),
-        evaluation_episode_lengths=np.array(evaluation_episode_length)
-    )
+    logger.save()
     env.close()
 
 if __name__ == "__main__":
