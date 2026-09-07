@@ -10,7 +10,7 @@ image_observations: False
 seed_steps: 5000    #was 5000
 eval_policy_every: 5
 eval_episodes: 10
-train_steps: 30000
+train_steps: 40000
 
 # Replay buffer / prioritized experience replay
 replay_capacity: 1000000
@@ -33,18 +33,19 @@ latent_dim: 50
 gamma: 0.99               # shorter effective horizon -> value target propagates from zero much faster
 time_lambda: 0.5
 reward_loss_weight: 0.5
-value_loss_weight: 0.5
+value_loss_weight: 0.1
 consistency_loss_weight: 2.0
 
 # Delta t conditioning (variable macro-step size)
-condition_dt: false        # true -> dynamics + reward heads take a Delta t (seconds) scalar
+condition_dt: true        # true -> dynamics + reward heads take a Delta t (seconds) scalar
 dt_scale: 1.0             # conditioning feature = dt * dt_scale (set ~1/dt_base to normalise)
 dt_base: null             # seconds per base env step; set at runtime by env.py
 k_max: 4                  # max macro-step stride (in base env steps) sampled during training
 plan_k: 1                 # fixed macro-step stride used by the planner
+planner: CEM              # CEM, CEM_hierarchical, MPPI
 
 # Sampling planner
-sampler: MPPI
+# sampler: cem_hierarchical
 horizon: 5
 sampling_noise: 0.3
 optimization_iterations: 10

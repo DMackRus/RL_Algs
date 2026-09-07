@@ -213,7 +213,7 @@ if __name__ == "__main__":
     # Testing adaptive timestep size
     testing_run("configs/fixed_versus_adaptive/adaptive_dt/config.yaml")
     # Testing non adaptive timestep size
-    # testing_run("configs/fixed_versus_adaptive/fixed_dt/config.yaml")
+    testing_run("configs/fixed_versus_adaptive/fixed_dt/config.yaml")
 
     #Just a single testing run
     # testing_run("configs/default/default.yaml")

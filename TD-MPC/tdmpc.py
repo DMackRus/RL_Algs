@@ -4,7 +4,7 @@ import torch.nn as nn
 from copy import deepcopy
 from torch import distributions as pyd
 from torch.distributions.utils import _standard_normal
-from planners import PredictiveSampler, MPPISampler, CEMPlanner
+from planners import PredictiveSampler, MPPISampler, CEMPlanner, CEMPlannerHierarchical, PolicyPlanner
 
 import utils
 
@@ -174,8 +174,13 @@ class TDMPC():
 		self.optim = torch.optim.Adam(self.model.parameters(), lr=float(self.cfg["lr"]))
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=float(self.cfg["lr"]))
 		self.aug = utils.RandomShiftsAug(cfg)
-		self.planner = CEMPlanner(self.cfg, self.model)
-		# self.planner = MPPISampler(self.cfg, self.model)
+		planners = {
+			"CEM": CEMPlanner,
+			"CEM_hierarchical": CEMPlannerHierarchical,
+			"MPPI": MPPISampler,
+			"policy": PolicyPlanner,
+		}
+		self.planner = planners[cfg["planner"]](self.cfg, self.model)
 		self.model.eval()
 		self.model_target.eval()
 
