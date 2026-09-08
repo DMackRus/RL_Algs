@@ -139,7 +139,7 @@ def testing_run(config_filepath):
     EVAL_EVERY = config["eval_policy_every"]          # eval once every N iterations
     EVAL_EPISODES = config.get("eval_episodes", 5)    # rollouts averaged per eval
 
-    # Create the dm_control environment (task / action_repeat set in the config).
+    # Create the environment (benchmark / task / action_repeat set in the config).
     env = make_env(config)
 
     if IMAGE_OBSERVATIONS:
@@ -153,7 +153,7 @@ def testing_run(config_filepath):
     config["state_dim"] = state_dim
     config["episode_length"] = env.ep_len
 
-    print(f"Env control timestep: {env.unwrapped.control_timestep()}")
+    print(f"Env control timestep: {env.control_timestep()}")
     print(f"Env episode length: {config['episode_length']}")
 
     # Make a TDMPC object

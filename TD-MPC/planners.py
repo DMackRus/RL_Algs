@@ -116,7 +116,7 @@ class LatentPlanner:
         for t in range(self.horizon):
             z, reward = self.model.next(z, actions[t], dt)
             G += discount * reward
-            discount *= (self.gamma ** k) # TODO - Should we discount by more here, depending on the time step? (gamma ** dt)
+            discount *= self.gamma # TODO - Should we discount by more here, depending on the time step? (gamma ** dt)
 
         terminal_action = self.model.pi(z, self.min_std)
         q_term = T.min(*self.model.Q(z, terminal_action))
@@ -128,7 +128,7 @@ class LatentPlanner:
             # Trust the coarse plan's long-horizon value where we tracked its
             # waypoint; fall back to the learned value at our endpoint if not.
             v_term = match * goal_value + (1 - match) * q_term
-            # G += discount * v_term
+            G += discount * v_term
             # Small explicit shaping pull toward the goal latent.
             G += discount * self.goal_reward_coef * match
         else:

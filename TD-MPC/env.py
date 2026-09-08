@@ -1,31 +1,46 @@
+"""
+Environment construction for TD-MPC.
+
+Two backends, both handed to the rest of the codebase through the same small
+classic-gym interface: an ``observation_space`` / ``action_space`` with a
+``.shape``, ``reset() -> obs``, ``step(a) -> (obs, reward, done, info)``, plus
+``ep_len``, ``control_timestep()`` and ``render(mode="rgb_array")``.
+
+  - dm_control suite   ->  cfg["benchmark"] == "dmc"        (default)
+  - Meta-World          ->  cfg["benchmark"] == "metaworld"
+
+No gymnasium dependency here: the spaces are a local ``Box`` (the code only ever
+reads ``.shape``), and the Meta-World backend consumes whatever the ``metaworld``
+package returns. There are no standalone gym tasks.
+"""
+
 from collections import deque, defaultdict
-from typing import Any, NamedTuple
-import dm_env
+
 import numpy as np
+import dm_env
 from dm_control import suite
 from dm_control.suite.wrappers import action_scale, pixels
-from dm_env import StepType, specs
-import gymnasium as gym
+from dm_env import specs
+
 import warnings
-warnings.filterwarnings("ignore", category=DeprecationWarning) 
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 
-class ExtendedTimeStep(NamedTuple):
-	step_type: Any
-	reward: Any
-	discount: Any
-	observation: Any
-	action: Any
+class Box:
+	"""Minimal stand-in for ``gym.spaces.Box``. The codebase only reads
+	``.shape`` (and occasionally ``.low`` / ``.high`` / ``.dtype``)."""
 
-	def first(self):
-		return self.step_type == StepType.FIRST
+	def __init__(self, low, high, shape, dtype=np.float32):
+		shape = tuple(int(x) for x in shape)
+		self.low = low if np.ndim(low) else np.full(shape, low, dtype=dtype)
+		self.high = high if np.ndim(high) else np.full(shape, high, dtype=dtype)
+		self.shape = shape
+		self.dtype = dtype
 
-	def mid(self):
-		return self.step_type == StepType.MID
 
-	def last(self):
-		return self.step_type == StepType.LAST
-
+# ---------------------------------------------------------------------------
+# dm_control wrappers (operate on the dm_env TimeStep API)
+# ---------------------------------------------------------------------------
 
 class ActionRepeatWrapper(dm_env.Environment):
 	def __init__(self, env, num_repeats):
@@ -138,134 +153,108 @@ class ActionDTypeWrapper(dm_env.Environment):
 		return getattr(self._env, name)
 
 
-class ExtendedTimeStepWrapper(dm_env.Environment):
-	def __init__(self, env):
-		self._env = env
+# ---------------------------------------------------------------------------
+# Classic-gym adapters (one per backend)
+# ---------------------------------------------------------------------------
 
-	def reset(self):
-		time_step = self._env.reset()
-		return self._augment_time_step(time_step)
+class DMCEnv:
+	"""dm_control env -> classic-gym interface used by the rest of the code."""
 
-	def step(self, action):
-		time_step = self._env.step(action)
-		return self._augment_time_step(time_step, action)
-
-	def _augment_time_step(self, time_step, action=None):
-		if action is None:
-			action_spec = self.action_spec()
-			action = np.zeros(action_spec.shape, dtype=action_spec.dtype)
-		return ExtendedTimeStep(observation=time_step.observation,
-								step_type=time_step.step_type,
-								action=action,
-								reward=time_step.reward or 0.0,
-								discount=time_step.discount or 1.0)
-
-	def observation_spec(self):
-		return self._env.observation_spec()
-
-	def action_spec(self):
-		return self._env.action_spec()
-
-	def __getattr__(self, name):
-		return getattr(self._env, name)
-
-
-class TimeStepToGymWrapper(object):
 	def __init__(self, env, domain, task, action_repeat, modality):
-		try: # pixels
-			obs_shp = env.observation_spec().shape
-			assert modality == 'pixels'
-		except: # state
-			obs_shp = []
-			for v in env.observation_spec().values():
-				try:
-					shp = np.prod(v.shape)
-				except:
-					shp = 1
-				obs_shp.append(shp)
-			obs_shp = (np.sum(obs_shp, dtype=np.int32),)
-			assert modality != 'pixels'
-		act_shp = env.action_spec().shape
-		obs_dtype = np.float32 if modality != 'pixels' else np.uint8
-		self.observation_space = gym.spaces.Box(
-			low=np.full(
-				obs_shp,
-				-np.inf if modality != 'pixels' else env.observation_spec().minimum,
-				dtype=obs_dtype),
-			high=np.full(
-				obs_shp,
-				np.inf if modality != 'pixels' else env.observation_spec().maximum,
-				dtype=obs_dtype),
-			shape=obs_shp,
-			dtype=obs_dtype,
-		)
-		self.action_space = gym.spaces.Box(
-			low=np.full(act_shp, env.action_spec().minimum),
-			high=np.full(act_shp, env.action_spec().maximum),
-			shape=act_shp,
-			dtype=env.action_spec().dtype)
 		self.env = env
 		self.domain = domain
 		self.task = task
-		self.ep_len = 1000//action_repeat
 		self.modality = modality
+		self.ep_len = 1000 // action_repeat
 		self.t = 0
-	
+
+		if modality == 'pixels':
+			self.observation_space = Box(0, 255, env.observation_spec().shape, np.uint8)
+		else:
+			dim = sum(int(np.prod(v.shape)) for v in env.observation_spec().values())
+			self.observation_space = Box(-np.inf, np.inf, (dim,), np.float32)
+
+		aspec = env.action_spec()
+		self.action_space = Box(aspec.minimum, aspec.maximum, aspec.shape, aspec.dtype)
+
 	@property
 	def unwrapped(self):
 		return self.env
 
-	@property
-	def reward_range(self):
-		return None
+	def control_timestep(self):
+		return self.env.control_timestep()
 
-	@property
-	def metadata(self):
-		return None
-	
-	def _obs_to_array(self, obs):
-		if self.modality != 'pixels':
-			return np.concatenate([v.flatten() for v in obs.values()])
-		return obs
+	def _obs(self, observation):
+		if self.modality == 'pixels':
+			return observation
+		return np.concatenate([v.flatten() for v in observation.values()])
 
 	def reset(self):
 		self.t = 0
-		return self._obs_to_array(self.env.reset().observation)
-	
+		return self._obs(self.env.reset().observation)
+
 	def step(self, action):
 		self.t += 1
-		time_step = self.env.step(action)
-		return self._obs_to_array(time_step.observation), time_step.reward, time_step.last() or self.t == self.ep_len, defaultdict(float)
+		ts = self.env.step(action)
+		done = ts.last() or self.t == self.ep_len
+		return self._obs(ts.observation), ts.reward, done, defaultdict(float)
 
 	def render(self, mode='rgb_array', width=384, height=384, camera_id=0):
 		camera_id = dict(quadruped=2).get(self.domain, camera_id)
 		return self.env.physics.render(height, width, camera_id)
 
 
-# NOTE: gymnasium's `gym.Wrapper` requires the wrapped env to be a
-# `gymnasium.Env` (and imposes the 5-tuple step API). `TimeStepToGymWrapper`
-# is a plain object exposing the classic 4-tuple API, so this stays a simple
-# pass-through wrapper that delegates everything it does not override.
-class DefaultDictWrapper:
-	def __init__(self, env):
+class MetaWorldEnv:
+	"""Meta-World (gymnasium API) -> the same classic-gym interface as DMCEnv."""
+
+	def __init__(self, env, action_repeat, max_episode_steps):
 		self.env = env
+		self._action_repeat = action_repeat
+		self.ep_len = max_episode_steps // action_repeat
+		self.t = 0
+
+		o, a = env.observation_space, env.action_space
+		self.observation_space = Box(o.low, o.high, o.shape, np.float32)
+		self.action_space = Box(a.low, a.high, a.shape, np.float32)
+
+	@property
+	def unwrapped(self):
+		return self.env.unwrapped
+
+	def control_timestep(self):
+		inner = self.env.unwrapped
+		return float(inner.model.opt.timestep) * int(inner.frame_skip)
+
+	def reset(self):
+		self.t = 0
+		obs, _ = self.env.reset()
+		return np.asarray(obs, dtype=np.float32)
 
 	def step(self, action):
-		obs, reward, done, info = self.env.step(action)
-		return obs, reward, done, defaultdict(float, info)
+		self.t += 1
+		total_reward, terminated, truncated, info = 0.0, False, False, {}
+		for _ in range(self._action_repeat):
+			obs, reward, terminated, truncated, info = self.env.step(action)
+			total_reward += float(reward)
+			if terminated or truncated:
+				break
+		done = terminated or truncated or self.t == self.ep_len
+		return np.asarray(obs, dtype=np.float32), total_reward, done, defaultdict(float, info)
 
-	def __getattr__(self, name):
-		return getattr(self.env, name)
+	def render(self, mode='rgb_array', width=384, height=384, camera_id=0):
+		return self.env.render()
 
 
-def make_env(cfg):
-	"""
-	Make DMControl environment for TD-MPC experiments.
-	Adapted from https://github.com/facebookresearch/drqv2
-	"""
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+
+def _make_dmc(cfg):
+	"""dm_control suite. Adapted from https://github.com/facebookresearch/drqv2"""
 	domain, task = cfg["task"].replace('-', '_').split('_', 1)
 	domain = dict(cup='ball_in_cup').get(domain, domain)
-	assert (domain, task) in suite.ALL_TASKS
+	assert (domain, task) in suite.ALL_TASKS, f"unknown dm_control task: {domain} {task}"
+
 	env = suite.load(domain,
 					 task,
 					 task_kwargs={'random': cfg["seed"]},
@@ -273,23 +262,76 @@ def make_env(cfg):
 	# Physical seconds advanced per agent action (control step * action repeat).
 	# Used as the base unit for Delta t conditioning.
 	cfg["dt_base"] = float(env.control_timestep()) * cfg["action_repeat"]
+
 	env = ActionDTypeWrapper(env, np.float32)
 	env = ActionRepeatWrapper(env, cfg["action_repeat"])
 	env = action_scale.Wrapper(env, minimum=-1.0, maximum=+1.0)
 
 	if cfg["image_observations"]:
-		if (domain, task) in suite.ALL_TASKS:
-			camera_id = dict(quadruped=2).get(domain, 0)
-			render_kwargs = dict(height=84, width=84, camera_id=camera_id)
-			env = pixels.Wrapper(env,
-								pixels_only=True,
-								render_kwargs=render_kwargs)
+		camera_id = dict(quadruped=2).get(domain, 0)
+		render_kwargs = dict(height=84, width=84, camera_id=camera_id)
+		env = pixels.Wrapper(env, pixels_only=True, render_kwargs=render_kwargs)
 		env = FrameStackWrapper(env, cfg.get('frame_stack', 1), cfg["modality"])
-	env = ExtendedTimeStepWrapper(env)
-	env = TimeStepToGymWrapper(env, domain, task, cfg["action_repeat"], cfg["modality"])
-	env = DefaultDictWrapper(env)
 
-	# Convenience
+	return DMCEnv(env, domain, task, cfg["action_repeat"], cfg["modality"])
+
+
+def _make_metaworld(cfg):
+	"""Meta-World single-task (Farama fork). ``pip install metaworld``.
+
+	UNTESTED against this repo's dependency set - verify once Meta-World is
+	installed. ``cfg["task"]`` is the full env name (e.g. "reach-v2");
+	``cfg["metaworld_task_idx"]`` picks the goal among the 50 train tasks.
+	"""
+	try:
+		import metaworld
+	except ImportError as e:
+		raise ImportError(
+			"Meta-World is not installed. Install the Farama fork "
+			"(`pip install metaworld`, needs mujoco), then set "
+			"benchmark: metaworld in the config."
+		) from e
+
+	assert not cfg["image_observations"], "metaworld backend is state-only"
+
+	name = cfg["task"]
+	mt1 = metaworld.MT1(name, seed=cfg["seed"])
+	env = mt1.train_classes[name](render_mode="rgb_array")
+	tasks = mt1.train_tasks
+	env.set_task(tasks[cfg.get("metaworld_task_idx", 0) % len(tasks)])
+
+	inner = env.unwrapped
+	cfg["dt_base"] = (
+		float(inner.model.opt.timestep) * int(inner.frame_skip) * cfg["action_repeat"]
+	)
+
+	return MetaWorldEnv(
+		env,
+		action_repeat=cfg["action_repeat"],
+		max_episode_steps=int(getattr(inner, "max_path_length", 500)),
+	)
+
+
+_BACKENDS = {
+	"dmc": _make_dmc,
+	"metaworld": _make_metaworld,
+}
+
+
+def make_env(cfg):
+	"""Build the environment for a TD-MPC experiment.
+
+	Dispatches on ``cfg["benchmark"]`` ("dmc" by default). Sets ``cfg["dt_base"]``
+	and the ``obs_shape`` / ``action_shape`` / ``action_dim`` convenience keys.
+	"""
+	benchmark = cfg.get("benchmark", "dmc")
+	if benchmark not in _BACKENDS:
+		raise ValueError(
+			f"unknown benchmark {benchmark!r}; expected one of {sorted(_BACKENDS)}"
+		)
+
+	env = _BACKENDS[benchmark](cfg)
+
 	cfg["obs_shape"] = tuple(int(x) for x in env.observation_space.shape)
 	cfg["action_shape"] = tuple(int(x) for x in env.action_space.shape)
 	cfg["action_dim"] = env.action_space.shape[0]

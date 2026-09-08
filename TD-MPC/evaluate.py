@@ -8,7 +8,7 @@ from env import make_env
 from tdmpc import TDMPC
 from replay_buffer import Episode
 
-def save_video(frames, path, fps=30):
+def save_video(frames, path, fps=15):
     """Write a list of RGB uint8 (H, W, 3) frames to an mp4."""
     if not frames:
         return
@@ -28,7 +28,7 @@ def main():
 
 if __name__ == "__main__":
 
-    test_folder = "configs/fixed_versus_adaptive/adaptive_dt"
+    test_folder = "configs/fixed_versus_adaptive/fixed_dt"
     yaml_name = "config.yaml"
     model_name = "checkpoint_step30000.pt"
     video_folder_name = "eval_videos"
