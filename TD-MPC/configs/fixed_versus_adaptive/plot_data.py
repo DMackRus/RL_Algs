@@ -12,6 +12,15 @@ def rolling_average(steps, values, window):
     return steps[window - 1:], avg
 
 
+# npz key -> (nice axis label, plot title)
+LOSS_METRICS = {
+    "metric_consistency_loss": ("Consistency Loss", "Consistency Loss"),
+    "metric_reward_loss": ("Reward Loss", "Reward Loss"),
+    "metric_value_loss": ("Value Loss", "Value Loss"),
+    "metric_total_loss": ("Total Loss", "Total Loss"),
+}
+
+
 def load_training_data():
     """
     Load all training_stats.npz files inside subfolders.
@@ -43,15 +52,36 @@ def load_training_data():
 
         data = np.load(training_file)
 
-        experiments[folder] = {
+        record = {
             "steps": data["steps"],
             "rewards": data["training_episode_rewards"],
-            "total_loss": data["metric_total_loss"],
         }
+        for key in LOSS_METRICS:
+            if key in data.files:
+                record[key] = data[key]
+            else:
+                print(f"  {folder}: missing {key}")
+
+        experiments[folder] = record
 
         print(f"Loaded {folder}")
 
     return experiments
+
+
+def _plot_series(ax, steps, values, window, label):
+    """Plot a raw (faint) + rolling-average (bold) series, skipping NaNs."""
+    steps = np.asarray(steps, dtype=float)
+    values = np.asarray(values, dtype=float)
+
+    mask = np.isfinite(values)
+    if not mask.any():
+        return
+    steps, values = steps[mask], values[mask]
+
+    avg_steps, avg = rolling_average(steps, values, window)
+    line, = ax.plot(avg_steps, avg, linewidth=2, label=label)
+    ax.plot(steps, values, alpha=0.15, color=line.get_color())
 
 
 def plot_fixed_versus_adaptive(window=25):
@@ -65,12 +95,7 @@ def plot_fixed_versus_adaptive(window=25):
     fig1, ax1 = plt.subplots(figsize=(10, 6))
 
     for name, data in experiments.items():
-        steps = data["steps"]
-        rewards = data["rewards"]
-        avg_steps, reward_avg = rolling_average(steps, rewards, window)
-
-        line, = ax1.plot(avg_steps, reward_avg, linewidth=2, label=name)
-        ax1.plot(steps, rewards, alpha=0.15, color=line.get_color())
+        _plot_series(ax1, data["steps"], data["rewards"], window, name)
 
     ax1.set_xlabel("Step")
     ax1.set_ylabel("Training Reward")
@@ -81,25 +106,26 @@ def plot_fixed_versus_adaptive(window=25):
     fig1.tight_layout()
     fig1.savefig("fixed_versus_adaptive_reward.png", dpi=300)
 
-    # --- Total loss vs steps ---
-    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    # --- Losses (consistency / reward / value / total) vs steps ---
+    fig2, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
 
-    for name, data in experiments.items():
-        steps = data["steps"]
-        total_loss = data["total_loss"]
-        avg_steps, loss_avg = rolling_average(steps, total_loss, window)
+    for ax, (key, (ylabel, title)) in zip(axes.flat, LOSS_METRICS.items()):
+        for name, data in experiments.items():
+            if key not in data:
+                continue
+            _plot_series(ax, data["steps"], data[key], window, name)
 
-        line, = ax2.plot(avg_steps, loss_avg, linewidth=2, label=name)
-        ax2.plot(steps, total_loss, alpha=0.15, color=line.get_color())
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{title}: Fixed vs Adaptive dt")
+        ax.set_yscale("log")
+        ax.legend()
+        ax.grid(True, which="both", alpha=0.3)
 
-    ax2.set_xlabel("Step")
-    ax2.set_ylabel("Total Loss")
-    ax2.set_title("Total Loss: Fixed vs Adaptive dt")
-    ax2.legend()
-    ax2.grid(True)
+    for ax in axes[-1]:
+        ax.set_xlabel("Step")
 
     fig2.tight_layout()
-    fig2.savefig("fixed_versus_adaptive_total_loss.png", dpi=300)
+    fig2.savefig("fixed_versus_adaptive_losses.png", dpi=300)
 
     plt.show()
 

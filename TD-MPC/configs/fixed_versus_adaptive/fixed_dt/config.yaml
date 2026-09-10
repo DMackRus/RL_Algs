@@ -7,17 +7,18 @@ action_repeat: 2         # env steps executed per agent action
 image_observations: False
 
 # Training parameters
+training_algorithm: tdmpc
 seed_steps: 5000    #was 5000
 eval_policy_every: 5
-eval_episodes: 10
-train_steps: 40000
+eval_episodes: 5
+train_steps: 30000
 
 # Replay buffer / prioritized experience replay
 replay_capacity: 1000000
 prioritized_replay: False
 per_alpha: 0.6          # prioritization exponent (0 = uniform sampling)
 per_beta: 0.4
-per_beta_frames: 200000 # env steps over which beta reaches 1.0
+per_beta_frames: 50000 # env steps over which beta reaches 1.0
 
 min_std: 0.05
 std_schedule: linear(0.5, 0.05, 25000)   # final == min_std
@@ -31,21 +32,22 @@ batch_size: 512
 latent_dim: 50
 # hidden_dim: 256
 gamma: 0.99               # shorter effective horizon -> value target propagates from zero much faster
-time_lambda: 0.5
+# time_lambda: 0.5
 reward_loss_weight: 0.5
 value_loss_weight: 0.1
 consistency_loss_weight: 2.0
 
 # Delta t conditioning (variable macro-step size)
-condition_dt: true        # true -> dynamics + reward heads take a Delta t (seconds) scalar
+# condition_dt: true        # true -> dynamics + reward heads take a Delta t (seconds) scalar
 dt_scale: 1.0             # conditioning feature = dt * dt_scale (set ~1/dt_base to normalise)
 dt_base: null             # seconds per base env step; set at runtime by env.py
+k_min: 1                  # min macro-step stride sampled during training
 k_max: 4                  # max macro-step stride (in base env steps) sampled during training
+k_sampling: step          # batch -> one stride per update; sequence -> one per branch; step -> one per (step, branch)
 plan_k: 1                 # fixed macro-step stride used by the planner
-planner: CEM              # CEM, CEM_hierarchical, MPPI
 
 # Sampling planner
-# sampler: cem_hierarchical
+planner: CEM        #CEM, CEM_hierarchical, CEM_multistep, MPPI, predictive-sampling, policy
 horizon: 5
 sampling_noise: 0.3
 optimization_iterations: 10
@@ -80,6 +82,10 @@ CEM:
   max_noise_std: 2.0
   # Number of CEM optimization iterations per plan() call
   num_opt_iterations: 6
+  # planner: CEM_multistep only. Per-horizon-step macro-step schedule
+  # (non-decreasing; clipped/padded to `horizon`). Fine steps early for action
+  # resolution, coarse steps late for cheap long-range lookahead.
+  step_k_schedule: [1, 1, 2, 2, 4, 4]
   # Softmax temperature for elite weighting
   temperature: 0.5
   # Momentum on the distribution mean across CEM iterations
@@ -115,7 +121,7 @@ update_freq: 2            # env steps between target-network EMA updates
 iterations: 6             # CEM optimisation iterations
 num_samples: 512          # sampled action trajectories per iteration
 num_elites: 64            # elite trajectories kept per iteration
-mixture_coef: 0.05        # fraction of trajectories seeded from the policy
+mixture_coef: 0.00        # fraction of trajectories seeded from the policy (was 0.05)
 temperature: 0.5          # softmax temperature for elite weighting
 momentum: 0.1             # mean update momentum across iterations
 

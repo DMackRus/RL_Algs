@@ -1,20 +1,69 @@
 import numpy as np
+import time
 import torch
 import torch.nn as nn
 from copy import deepcopy
+from torch import distributions as pyd
+from torch.distributions.utils import _standard_normal
 from planners import PredictiveSampler, MPPISampler, CEMPlanner, CEMPlannerHierarchical, CEMPlannerMultistep, PolicyPlanner
 
 import utils
-from utils import set_requires_grad, enc, mlp, q, orthogonal_init, NormalizeImg, Flatten, TruncatedNormal
+from utils import set_requires_grad, enc, mlp, q
 
-class TOLD(nn.Module):
+class TruncatedNormal(pyd.Normal):
+	"""Utility class implementing the truncated normal distribution."""
+	def __init__(self, loc, scale, low=-1.0, high=1.0, eps=1e-6):
+		super().__init__(loc, scale, validate_args=False)
+		self.low = low
+		self.high = high
+		self.eps = eps
+
+	def _clamp(self, x):
+		clamped_x = torch.clamp(x, self.low + self.eps, self.high - self.eps)
+		x = x - x.detach() + clamped_x.detach()
+		return x
+
+	def sample(self, clip=None, sample_shape=torch.Size()):
+		shape = self._extended_shape(sample_shape)
+		eps = _standard_normal(shape,
+							   dtype=self.loc.dtype,
+							   device=self.loc.device)
+		eps *= self.scale
+		if clip is not None:
+			eps = torch.clamp(eps, -clip, clip)
+		x = self.loc + eps
+		return self._clamp(x)
+
+
+class NormalizeImg(nn.Module):
+	"""Normalizes pixel observations to [0,1) range."""
+	def __init__(self):
+		super().__init__()
+
+	def forward(self, x):
+		return x.div(255.)
+
+
+class Flatten(nn.Module):
+	"""Flattens its input to a (batched) vector."""
+	def __init__(self):
+		super().__init__()
+		
+	def forward(self, x):
+		return x.view(x.size(0), -1)
+
+class TOLDAdaptive(nn.Module):
 	"""Task-Oriented Latent Dynamics (TOLD) model used in TD-MPC."""
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
+		self.dt_scale = float(cfg.get("dt_scale", 1.0))   # feature = dt * dt_scale
+
+		# These models are conditioned on delta timestep (dt), ergo one extra input dimension
+		dt_extra = 1
 		self._encoder = enc(cfg)
-		self._dynamics = mlp(cfg["latent_dim"]+cfg["action_dim"], cfg["mlp_dim"], cfg["latent_dim"])
-		self._reward = mlp(cfg["latent_dim"]+cfg["action_dim"], cfg["mlp_dim"], 1)
+		self._dynamics = mlp(cfg["latent_dim"]+cfg["action_dim"]+dt_extra, cfg["mlp_dim"], cfg["latent_dim"])
+		self._reward = mlp(cfg["latent_dim"]+cfg["action_dim"]+dt_extra, cfg["mlp_dim"], 1)
 		self._pi = mlp(cfg["latent_dim"], cfg["mlp_dim"], cfg["action_dim"])
 		self._Q1, self._Q2 = q(cfg), q(cfg)
 		self.apply(utils.orthogonal_init)
@@ -31,10 +80,42 @@ class TOLD(nn.Module):
 		"""Encodes an observation into its latent representation (h)."""
 		return self._encoder(obs)
 
-	def next(self, z, a):
-		"""Predicts next latent state (d) and reward (R)."""
-		x = torch.cat([z, a], dim=-1)
-		return self._dynamics(x), self._reward(x)
+	def _dt_feat(self, dt, ref):
+		"""Build the (B, 1) Delta t conditioning feature, or None when disabled.
+
+		dt may be a python scalar or a tensor broadcastable to (B, 1); it is the
+		physical timestep in seconds. ref is any (B, ...) tensor used for batch
+		size / device / dtype.
+		"""
+		if not torch.is_tensor(dt):
+			dt = torch.full((ref.shape[0], 1), float(dt), device=ref.device, dtype=ref.dtype)
+		else:
+			dt = dt.to(device=ref.device, dtype=ref.dtype).reshape(-1, 1).expand(ref.shape[0], 1)
+		return dt * self.dt_scale
+
+	def next(self, z, a, dt):
+		"""Predicts next latent state (d) and reward (R).
+
+		dt: physical timestep (seconds) the step advances. Required when
+		cfg['condition_dt'] is set; ignored otherwise. When conditioned, the
+		reward head predicts the return accumulated over that interval, not a
+		single-step reward.
+		"""
+
+		if dt is None:
+			raise ValueError("dt must be provided when cfg['condition_dt'] is set")
+
+		feats = [z, a]
+		dt_feat = self._dt_feat(dt, z)
+		if dt_feat is not None:
+			feats.append(dt_feat)
+		x = torch.cat(feats, dim=-1)
+
+		# Dynamics  using Euler Integration: z_{t+1} = z_t + f(z_t, a_t) * dt
+		dz = self._dynamics(x)
+		z_next = z + (dz * dt)
+
+		return z_next, self._reward(x)
 
 	def pi(self, z, std=0):
 		"""Samples an action from the learned policy (pi)."""
@@ -49,13 +130,14 @@ class TOLD(nn.Module):
 		x = torch.cat([z, a], dim=-1)
 		return self._Q1(x), self._Q2(x)
 
-class TDMPC():
+class TDMPCAdaptive(nn.Module):
 	"""Implementation of TD-MPC learning + inference."""
 	def __init__(self, cfg):
+		super().__init__()
 		self.cfg = cfg
 		self.device = torch.device('cuda')
 		self.std = utils.linear_schedule(cfg["std_schedule"], 0)
-		self.model = TOLD(cfg).cuda()
+		self.model = TOLDAdaptive(cfg).cuda()
 		self.model_target = deepcopy(self.model)
 		self.optim = torch.optim.Adam(self.model.parameters(), lr=float(self.cfg["lr"]))
 		self.pi_optim = torch.optim.Adam(self.model._pi.parameters(), lr=float(self.cfg["lr"]))
@@ -86,6 +168,14 @@ class TDMPC():
 		self.model.load_state_dict(d['model'])
 		self.model_target.load_state_dict(d['model_target'])
 
+	def _macro_dt(self, k):
+		"""
+		Convert a discrete number of timesteps (k) to a physical timestep in seconds.
+
+		"""
+		dt_base = float(self.cfg["dt_base"])
+		return k.float() * dt_base if torch.is_tensor(k) else k * dt_base
+
 	@torch.no_grad()
 	def plan(self, obs, eval_mode=False, step=None, t0=True):
 		"""
@@ -100,7 +190,9 @@ class TDMPC():
 			return torch.empty(self.cfg["action_dim"], dtype=torch.float32, device=self.device).uniform_(-1, 1)
 
 		obs = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+		# time_start = time.time()
 		action, _ = self.planner.plan(obs, t0=t0)
+		# print(f"Planning time: {time.time() - time_start:.3f}s")
 		return action
 
 	def update_pi(self, zs):
@@ -122,16 +214,29 @@ class TDMPC():
 		return pi_loss.item()
 
 	@torch.no_grad()
-	def _td_target(self, next_obs, reward):
-		"""Compute the TD-target from a reward and the observation at the next step."""
+	def _td_target(self, next_obs, reward, k=1):
+		"""Compute the TD-target from a (k-step) reward and the observation k base
+		steps later. reward is the discounted return over the macro-step, so the
+		bootstrap term is discounted by gamma**k. k may be a scalar or a per-branch
+		(batch,) tensor of strides."""
 		next_z = self.model.h(next_obs)
-		td_target = reward + self.cfg["discount"] * \
+		discount = self.cfg["discount"] ** k
+		if torch.is_tensor(discount):
+			discount = discount.to(reward.device, reward.dtype).view(-1, 1)
+		td_target = reward + discount * \
 			torch.min(*self.model_target.Q(next_z, self.model.pi(next_z, self.cfg["min_std"])))
 		return td_target
 
 	def update(self, replay_buffer, step):
 		"""Main update function. Corresponds to one iteration of the TOLD model learning."""
-		obs, next_obses, action, reward, idxs, weights, _ = replay_buffer.sample()
+		obs, next_obses, action, reward, idxs, weights, k = replay_buffer.sample()
+		# k is a scalar (single-step / unconditioned) or a (horizon+1, batch)
+		# tensor of per-step, per-branch strides. dt matches its shape.
+		dt = self._macro_dt(k)
+
+		# print(f" k: {k}, dt: {dt}")
+
+
 		self.optim.zero_grad(set_to_none=True)
 		self.std = utils.linear_schedule(self.cfg["std_schedule"], step)
 		self.model.train()
@@ -144,12 +249,15 @@ class TDMPC():
 		for t in range(self.cfg["horizon"]):
 
 			# Predictions
+			# dt_t as (batch, 1) so it broadcasts against the latent in next().
+			dt_t = dt[t].unsqueeze(-1) if torch.is_tensor(dt) else dt
+			k_t = k[t] if torch.is_tensor(k) else k
 			Q1, Q2 = self.model.Q(z, action[t])
-			z, reward_pred = self.model.next(z, action[t])
+			z, reward_pred = self.model.next(z, action[t], dt_t)
 			with torch.no_grad():
 				next_obs = self.aug(next_obses[t])
 				next_z = self.model_target.h(next_obs)
-				td_target = self._td_target(next_obs, reward[t])
+				td_target = self._td_target(next_obs, reward[t], k_t)
 			zs.append(z.detach())
 
 			# Losses

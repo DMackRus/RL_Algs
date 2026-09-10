@@ -1,0 +1,82 @@
+name: LeWorldModel (state)
+device: cuda
+
+# Task parameters
+# dm_control domain-task. Needs a task-specific goal state in goals.py:
+#   reacher-easy / reacher-hard, cartpole-swingup / cartpole-balance,
+#   cup-catch (ball_in_cup), pendulum-swingup, acrobot-swingup,
+#   finger-turn_easy / finger-turn_hard, walker-*, hopper-*
+task: reacher-hard
+action_repeat: 2
+image_observations: False
+modality: state
+benchmark: dmc
+seed: 1
+
+# Training algorithm
+training_algorithm: lewm
+seed_steps: 5000
+eval_policy_every: 5
+eval_episodes: 5
+train_steps: 50000
+
+# Replay buffer (uniform sampling: reward-free, no priority signal by default)
+replay_capacity: 1000000
+prioritized_replay: False
+per_alpha: 0.6
+per_beta: 0.4
+per_beta_frames: 50000
+lewm_prioritized: False        # true -> prioritize by next-latent prediction error
+
+# ---------------------------------------------------------------------------
+# LeWM model / loss
+# ---------------------------------------------------------------------------
+latent_dim: 50
+lewm_enc_dim: 256              # encoder trunk hidden width
+lewm_mlp_dim: 512             # latent predictor hidden width
+lr: 3e-4
+grad_clip_norm: 10
+batch_size: 256
+
+sigreg_weight: 0.1            # lambda on SIGReg (paper default)
+sigreg_num_proj: 512         # random projections (paper: 1024; lower = less VRAM)
+sigreg_knots: 17
+
+# ---------------------------------------------------------------------------
+# Exploratory data collection (reward-free: no planning during training)
+# ---------------------------------------------------------------------------
+exploration: uniform         # uniform | brownian
+expl_std: 0.3                # brownian step std
+
+# ---------------------------------------------------------------------------
+# Goal-conditioned CEM planning (evaluation only)
+# ---------------------------------------------------------------------------
+planner: CEM
+horizon: 5
+goal_cost: terminal          # terminal | dense
+goal_success_dist: 0.05      # |obs - goal| below this counts as success
+
+CEM:
+  num_candidates: 256
+  num_elites: 64
+  noise_std: 0.1             # floor on per-step sampling std
+  max_noise_std: 2.0         # ceiling / initial per-step sampling std
+  temperature: 0.5
+  momentum: 0.1
+  num_opt_iterations: 8
+
+# Kept for compatibility with shared modules (replay_buffer / env).
+frame_stack: 1
+aug_pad: 0
+sampling_noise: 0.3
+discount: 0.99
+gamma: 0.99
+enc_dim: 256
+mlp_dim: 512
+num_channels: 32
+img_size: 64
+obs_shape: null
+dt_base: null
+k_min: 1
+k_max: 4
+k_sampling: step

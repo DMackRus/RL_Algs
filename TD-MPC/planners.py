@@ -38,9 +38,14 @@ class LatentPlanner:
         self.goal_reward_coef = float(config.get("goal_reward_coef", 1.0))
         self.goal_match_tau = float(config.get("goal_match_tau", 1.0))
 
+        if config["training_algorithm"] == "tdmpc":
+            self.adaptive_dt = False
+        else:
+            self.adaptive_dt = True
+
         # Hardcoded for now, planner always only advance by a single timestep.
-        k = 1
-        self.dt = k * float(config["dt_base"]) if self.model.cond_dt else None
+        # k = 1
+        # self.dt = k * float(config["dt_base"]) if self.model.cond_dt else None
 
         # Warm-started nominal / mean action sequence, carried across time steps.
         self.nominal_actions = T.zeros(
@@ -57,11 +62,15 @@ class LatentPlanner:
             device=self.device,
         )
 
-    def _policy_trajectories(self, z0, num_pi_trajs):
+    def _policy_trajectories(self, z0, num_pi_trajs, k=1, step_k=None):
         """
         Roll out `num_pi_trajs` action sequences from the learned policy.
 
         z0 : (1, latent_dim)
+        k  : scalar macro-step size for the rollout (dt = k * dt_base when the
+             model is dt-conditioned)
+        step_k : optional per-horizon-step sequence of macro-step sizes. When
+             given it overrides `k` (used by CEMPlannerMultistep).
 
         returns:
             (horizon, num_pi_trajs, action_dim), or None when num_pi_trajs == 0
@@ -77,69 +86,82 @@ class LatentPlanner:
             device=self.device,
         )
         z = z0.repeat(num_pi_trajs, 1)
-
-        
+        dt_base = float(self.config["dt_base"]) if self.adaptive_dt else None
 
         for t in range(self.horizon):
             pi_actions[t] = self.model.pi(z, self.min_std)
-            
-            z, _ = self.model.next(z, pi_actions[t], self.dt)
+
+            if self.adaptive_dt:
+                kt = step_k[t] if step_k is not None else k
+                z, _ = self.model.next(z, pi_actions[t], kt * dt_base)
+            else:
+                z, _ = self.model.next(z, pi_actions[t])
 
         return pi_actions
 
-    def _estimate_value(self, z, actions, num_timesteps=1, goal_z=None, goal_value=None):
+    def _estimate_value(self, z, actions, num_timesteps=1, goal_z=None):
         """
         Estimate the discounted return of each candidate action sequence.
 
         z       : (num_traj, latent_dim)
         actions : (horizon, num_traj, action_dim)
-        num_timesteps : macro-step size k -> each model step advances k * dt_base
-                        seconds (1, i.e. a single base step, when dt is fixed)
-        goal_z     : (1, latent_dim) or None. Sub-goal latent handed down from
-                     the coarser stage of the hierarchical planner.
-        goal_value : scalar tensor or None. The coarser plan's discounted
-                     return-to-go from the goal node (its long-horizon value
-                     estimate for that waypoint).
+        num_timesteps : macro-step size. Either a scalar k held for the whole
+                        horizon (each model step advances k * dt_base seconds;
+                        1, i.e. a single base step, when dt is fixed), or a
+                        per-horizon-step sequence of k's (CEMPlannerMultistep).
+                        Rewards are discounted by gamma**k per model step.
+        goal_z  : (1, latent_dim) or None. Sub-goal latent handed down from the
+                  coarser stage of the hierarchical planner.
 
-        With a goal, the terminal bootstrap is a match-weighted blend of that
-        coarse value-to-go and the learned terminal Q at the actual endpoint,
-        plus a small explicit pull toward the goal. Without one, it is the plain
-        learned terminal Q.
+        Terminal bootstrap:
+          - goal_z is None (coarsest stage): learned terminal value, min-Q at
+            the endpoint under the policy action.
+          - goal_z given (finer stages): a terminal cost that pulls the endpoint
+            latent onto the coarse waypoint,
+            goal_reward_coef * exp(-||z_T - goal_z|| / goal_match_tau).
+            No learned-value term here.
 
         returns : (num_traj, 1)
         """
 
         G, discount = 0.0, 1.0
-        k = num_timesteps
-        dt = k * float(self.config["dt_base"]) if self.model.cond_dt else None
+        # Debug metrics
+        reward_sum, end_value = 0.0, 0.0
+
+        if isinstance(num_timesteps, (list, tuple)):
+            k_seq = [int(k) for k in num_timesteps]
+        else:
+            k_seq = [int(num_timesteps)] * self.horizon
+        dt_base = float(self.config["dt_base"]) if self.adaptive_dt else None
 
         for t in range(self.horizon):
-            z, reward = self.model.next(z, actions[t], dt)
+            k = k_seq[t]
+            if self.adaptive_dt:
+                z, reward = self.model.next(z, actions[t], k * dt_base)
+            else:
+                z, reward = self.model.next(z, actions[t])
             G += discount * reward
-            discount *= self.gamma # TODO - Should we discount by more here, depending on the time step? (gamma ** dt)
-
-        terminal_action = self.model.pi(z, self.min_std)
-        q_term = T.min(*self.model.Q(z, terminal_action))
+            reward_sum += discount * reward
+            discount *= self.gamma ** k
 
         if goal_z is not None:
-            # Confidence that this candidate actually reached the coarse
-            # waypoint: 1 at the goal, decaying with latent distance.
+            # Finer stages: terminal cost matching the endpoint latent to the
+            # waypoint the coarser plan converged to.
             match = T.exp(-T.norm(z - goal_z, dim=1, keepdim=True) / self.goal_match_tau)
-            # Trust the coarse plan's long-horizon value where we tracked its
-            # waypoint; fall back to the learned value at our endpoint if not.
-            v_term = match * goal_value + (1 - match) * q_term
-            G += discount * v_term
-            # Small explicit shaping pull toward the goal latent.
             G += discount * self.goal_reward_coef * match
+            end_value = discount * self.goal_reward_coef * match
         else:
+            # Coarsest stage: learned terminal value estimate.
+            terminal_action = self.model.pi(z, self.min_std)
+            q_term = T.min(*self.model.Q(z, terminal_action))
             G += discount * q_term
+            end_value = discount * q_term
 
-        return G
+        return G, end_value, reward_sum
 
     def _reference_rollout(self, z0, action_seq, k):
         """
-        Noise-free rollout of a single action sequence, with the discounted
-        return-to-go at every node.
+        Noise-free rollout of a single action sequence.
 
         z0         : (1, latent_dim)
         action_seq : (horizon, action_dim)
@@ -148,47 +170,31 @@ class LatentPlanner:
         returns:
             latents : (horizon + 1, latent_dim) - latent at base-times
                       0, k, 2k, ..., k * horizon
-            values  : (horizon + 1,) - discounted return from each node to the
-                      end of this rollout (in that node's own discount frame),
-                      bootstrapped with the learned terminal Q at the last node.
         """
-        dt = k * float(self.config["dt_base"]) if self.model.cond_dt else None
+        dt = k * float(self.config["dt_base"])
         z = z0.clone()
         latents = [z]
-        rewards = []
         for t in range(action_seq.shape[0]):
-            z, r = self.model.next(z, action_seq[t].unsqueeze(0), dt)
+            z, _ = self.model.next(z, action_seq[t].unsqueeze(0), dt)
             latents.append(z)
-            rewards.append(r.reshape(()))
-        latents = T.cat(latents, dim=0)
-
-        term_action = self.model.pi(latents[-1:], self.min_std)
-        v = T.min(*self.model.Q(latents[-1:], term_action)).reshape(())
-        values = [v]
-        g = self.gamma ** k
-        for r in reversed(rewards):
-            v = r + g * v
-            values.append(v)
-        values = T.stack(list(reversed(values)))
-
-        return latents, values
+        return T.cat(latents, dim=0)
 
     @staticmethod
-    def _select_goal(latents, values, k_prev, k_next, horizon):
+    def _select_goal(latents, k_prev, k_next, horizon):
         """
-        Pick the sub-goal for a refined stage: the node of the coarser rollout
-        closest to (but not past) the real-time endpoint the refined plan can
-        actually reach.
+        Pick the sub-goal latent for a refined stage: the node of the coarser
+        rollout closest to (but not past) the real-time endpoint the refined
+        plan can actually reach.
 
         The refined plan spans k_next * horizon base steps; the coarser rollout
         has nodes at base-times 0, k_prev, 2*k_prev, ... so we take node
         floor(k_next * horizon / k_prev).
 
-        returns : (goal_z (1, latent_dim), goal_value (scalar))
+        returns : goal_z (1, latent_dim)
         """
         j = (k_next * horizon) // k_prev
         j = int(min(j, latents.shape[0] - 1))
-        return latents[j:j + 1], values[j]
+        return latents[j:j + 1]
 
     def _warm_start(self, plan, z0):
         """
@@ -199,102 +205,6 @@ class LatentPlanner:
         shifted[:-1] = plan[1:].clone()
         shifted[-1] = self.model.pi(z0, self.min_std).squeeze(0)
         self.nominal_actions = shifted
-
-class MPPISampler(LatentPlanner):
-
-    def __init__(
-        self,
-        config,
-        model,
-    ):
-
-        super().__init__(config, model)
-
-        self.num_samples = config["MPPI"]["num_candidates"]
-        self.noise_std = config["MPPI"]["noise_std"]
-        self.temperature = config["MPPI"]["temperature"]
-        self.num_opt_iterations = config["MPPI"]["num_opt_iterations"]
-        # Fraction of candidate trajectories seeded from the learned policy.
-        self.mixture_coef = config["MPPI"].get("mixture_coef", 0.0)
-
-    def plan(self, x0, t0=False):
-        """
-        MPPI planning in latent space.
-
-        x0 : (1, obs_dim)
-        t0 : True on the first step of an episode -> reset the warm-started plan
-
-        returns:
-            first action of the optimised plan, and its estimated value
-        """
-
-        with T.no_grad():
-
-            if t0:
-                self.reset()
-
-            z0 = self.model.h(x0)
-
-            # -------------------------------------------------
-            # Policy-seeded (mixture) trajectories
-            # -------------------------------------------------
-
-            num_pi_trajs = int(self.mixture_coef * self.num_samples)
-            pi_actions = self._policy_trajectories(z0, num_pi_trajs)
-
-            z = z0.repeat(self.num_samples + num_pi_trajs, 1)
-
-            for _ in range(self.num_opt_iterations):
-
-                # -------------------------------------------------
-                # Sample noisy action sequences around the nominal plan
-                # -------------------------------------------------
-
-                noise = self.noise_std * T.randn(
-                    self.horizon,
-                    self.num_samples,
-                    self.action_dim,
-                    device=self.device,
-                )
-                actions = (self.nominal_actions.unsqueeze(1) + noise).clamp(
-                    self.lower_action_bound,
-                    self.upper_action_bound,
-                )
-
-                if pi_actions is not None:
-                    actions = T.cat([actions, pi_actions], dim=1)
-
-                # -------------------------------------------------
-                # Evaluate candidates
-                # -------------------------------------------------
-
-                returns = self._estimate_value(z, actions).squeeze(1).nan_to_num_(0)
-
-                # -------------------------------------------------
-                # MPPI weights + nominal update
-                # -------------------------------------------------
-
-                beta = returns.max()
-                weights = T.exp((returns - beta) / self.temperature)
-                weights /= weights.sum() + 1e-9
-
-                # Weighted average of the candidate sequences (equivalent to
-                # nominal += sum_k w_k * noise_k, since sum_k w_k == 1).
-                self.nominal_actions = (weights.view(1, -1, 1) * actions).sum(dim=1).clamp(
-                    self.lower_action_bound,
-                    self.upper_action_bound,
-                )
-
-            # -------------------------------------------------
-            # Output + warm start
-            # -------------------------------------------------
-
-            action = self.nominal_actions[0].clone()
-            value = returns.max()
-
-            self._warm_start(self.nominal_actions, z0)
-
-            return action, value
 
 class CEMPlannerHierarchical(LatentPlanner):
     """
@@ -310,13 +220,13 @@ class CEMPlannerHierarchical(LatentPlanner):
     the chain from a coarse stage to the next finer one is:
 
       1. the warm-started mean / std (carried directly), and
-      2. a sub-goal: the coarse plan is rolled out noise-free; the node closest
-         to the finer plan's real-time reach gives both a goal latent and the
-         coarse plan's discounted return-to-go from that node. Finer stages
-         bootstrap with a match-weighted blend of that (long-horizon) coarse
-         value and the learned terminal Q at their own endpoint - so the coarse
-         plan's value acts as a longer-horizon terminal value when the finer
-         plan tracks its waypoint, and the learned Q takes over when it doesn't.
+      2. a sub-goal latent: the coarse plan is rolled out noise-free and the
+         node closest to the finer plan's real-time reach gives a goal latent.
+
+    Terminal bootstrap per stage (see _estimate_value):
+      - coarsest stage (no goal yet): the learned terminal value (min-Q).
+      - every finer stage: a terminal cost only, pulling the endpoint latent
+        onto the sub-goal, goal_reward_coef * exp(-||z_T - goal_z|| / tau).
     """
 
     def __init__(
@@ -325,11 +235,6 @@ class CEMPlannerHierarchical(LatentPlanner):
         model,
     ):
         super().__init__(config, model)
-
-        assert self.model.cond_dt, (
-            "CEMPlannerHierarchical needs a dt-conditioned model "
-            "(cfg['condition_dt'] = true)"
-        )
 
         cem = config["CEM"]
         self.num_samples = cem["num_candidates"]
@@ -381,7 +286,7 @@ class CEMPlannerHierarchical(LatentPlanner):
                 device=self.device,
             )
 
-            goal_z = goal_value = None
+            goal_z = None
             elite_actions = elite_value = score = None
 
             for i, k in enumerate(self.k_schedule):
@@ -392,10 +297,8 @@ class CEMPlannerHierarchical(LatentPlanner):
                 # ---------------------------------------------------------
                 if i > 0 and k != self.k_schedule[i - 1]:
                     k_prev = self.k_schedule[i - 1]
-                    ref_latents, ref_values = self._reference_rollout(z0, mean, k_prev)
-                    goal_z, goal_value = self._select_goal(
-                        ref_latents, ref_values, k_prev, k, self.horizon
-                    )
+                    ref_latents = self._reference_rollout(z0, mean, k_prev)
+                    goal_z = self._select_goal(ref_latents, k_prev, k, self.horizon)
                     if self.reset_std_on_refine:
                         std = self.max_sample_std * T.ones_like(std)
 
@@ -434,7 +337,12 @@ class CEMPlannerHierarchical(LatentPlanner):
                 # Evaluate candidates (goal_z is None at the coarsest stage
                 # -> falls back to the learned terminal value bootstrap)
                 # ---------------------------------------------------------
-                value = self._estimate_value(z, actions, k, goal_z, goal_value).nan_to_num_(0)
+                value, reward, value_end = self._estimate_value(z, actions, k, goal_z)
+
+                #Debug metrics
+                # print(f"total value: {value.mean():.3f} +- {value.std():.3f}")
+                # print(f"total reward: {reward.mean():.3f} +- {reward.std():.3f}")
+                # print(f"end value: {value_end.mean():.3f} +- {value_end.std():.3f}")      
 
                 elite_idxs = T.topk(
                     value.squeeze(1),
@@ -559,7 +467,12 @@ class CEMPlanner(LatentPlanner):
                     actions = T.cat([actions, pi_actions], dim=1)
 
                 # Evaluate candidates
-                value = self._estimate_value(z, actions).nan_to_num_(0)
+                value, reward, value_end = self._estimate_value(z, actions)
+
+                #Debug metrics
+                # print(f"total value: {value.mean():.3f} +- {value.std():.3f}")
+                # print(f"total reward: {reward.mean():.3f} +- {reward.std():.3f}")
+                # print(f"end value: {value_end.mean():.3f} +- {value_end.std():.3f}")
 
                 # Select elites
                 elite_idxs = T.topk(
@@ -608,6 +521,269 @@ class CEMPlanner(LatentPlanner):
             value = elite_value.max()
 
             self._warm_start(mean, z0)
+
+            return action, value
+
+class CEMPlannerMultistep(LatentPlanner):
+    """
+    CEM planner with a per-horizon-step macro-step schedule (fine -> coarse).
+
+    Like the plain CEMPlanner: a fixed number of CEM iterations, learned value
+    function as the terminal bootstrap. The only difference is the rollout -
+    horizon step t advances the world model by `step_k_schedule[t]` base env
+    steps (dt = step_k_schedule[t] * dt_base) rather than a single fixed step.
+
+    The schedule is non-decreasing, e.g. (1, 1, 2, 2, 4, 4): small steps near
+    the start of the plan, where the action actually executed needs resolution,
+    and big steps toward the end for cheap long-range lookahead. A horizon-H
+    plan then reaches sum(step_k_schedule[:H]) * dt_base seconds ahead while
+    only rolling the model H times.
+
+    Every CEM iteration uses the same schedule - contrast CEMPlannerHierarchical,
+    which sweeps a single (whole-rollout) k from coarse to fine across its
+    iterations.
+    """
+
+    def __init__(
+        self,
+        config,
+        model,
+    ):
+        super().__init__(config, model)
+
+        assert self.adaptive_dt, (
+            "CEMPlannerMultistep needs a dt-conditioned model "
+            "(training_algorithm != 'tdmpc')"
+        )
+
+        cem = config["CEM"]
+        self.num_samples = cem["num_candidates"]
+        self.num_elites = cem["num_elites"]
+        # Floor / ceiling on the per-step sampling std of the action distribution.
+        self.min_sample_std = cem["noise_std"]
+        self.max_sample_std = cem.get("max_noise_std", 2.0)
+        self.temperature = cem["temperature"]
+        self.momentum = cem["momentum"]
+        self.num_opt_iterations = cem.get("num_opt_iterations", 6)
+        # Fraction of candidate trajectories seeded from the learned policy.
+        self.mixture_coef = cem.get("mixture_coef", 0.0)
+
+        # One macro-step k per horizon step, non-decreasing. Clipped (if longer)
+        # or padded with its last value (if shorter) to exactly `horizon` entries.
+        sched = [int(k) for k in cem.get("step_k_schedule", (1, 1, 2, 2, 4, 4))]
+        if len(sched) >= self.horizon:
+            sched = sched[: self.horizon]
+        else:
+            sched = sched + [sched[-1]] * (self.horizon - len(sched))
+        self.step_k = sched
+        assert all(
+            a <= b for a, b in zip(self.step_k, self.step_k[1:])
+        ), f"step_k_schedule must be non-decreasing, got {self.step_k}"
+
+    def plan(self, x0, t0=False):
+        """
+        CEM planning in latent space with a fine -> coarse per-step schedule.
+
+        x0 : (1, obs_dim)
+        t0 : True on the first step of an episode -> reset the warm-started plan
+
+        returns:
+            first action of the sampled action sequence, and its estimated value
+        """
+
+        with T.no_grad():
+
+            if t0:
+                self.reset()
+
+            z0 = self.model.h(x0)
+
+            # -------------------------------------------------
+            # Policy-seeded (mixture) trajectories - rolled with the same
+            # per-step schedule as the candidates.
+            # -------------------------------------------------
+
+            num_pi_trajs = int(self.mixture_coef * self.num_samples)
+            pi_actions = self._policy_trajectories(
+                z0, num_pi_trajs, step_k=self.step_k
+            )
+            n_pi = 0 if pi_actions is None else pi_actions.shape[1]
+
+            z = z0.repeat(self.num_samples + n_pi, 1)
+
+            # -------------------------------------------------
+            # Initialise the CEM distribution (mean warm started from last plan)
+            # -------------------------------------------------
+
+            mean = self.nominal_actions.clone()
+            std = self.max_sample_std * T.ones(
+                self.horizon,
+                self.action_dim,
+                device=self.device,
+            )
+
+            for _ in range(self.num_opt_iterations):
+
+                # Sample candidate action sequences
+                actions = T.clamp(
+                    mean.unsqueeze(1)
+                    + std.unsqueeze(1)
+                    * T.randn(
+                        self.horizon,
+                        self.num_samples,
+                        self.action_dim,
+                        device=self.device,
+                    ),
+                    self.lower_action_bound,
+                    self.upper_action_bound,
+                )
+
+                if pi_actions is not None:
+                    actions = T.cat([actions, pi_actions], dim=1)
+
+                # Evaluate candidates under the fine -> coarse schedule
+                value, _, _ = self._estimate_value(z, actions, self.step_k)
+
+                # Select elites
+                elite_idxs = T.topk(
+                    value.squeeze(1),
+                    self.num_elites,
+                    dim=0,
+                ).indices
+                elite_value = value[elite_idxs]
+                elite_actions = actions[:, elite_idxs]
+
+                # Score-weighted update of the distribution
+                max_value = elite_value.max(0)[0]
+                score = T.exp(self.temperature * (elite_value - max_value))
+                score /= score.sum(0)
+
+                _mean = T.sum(
+                    score.unsqueeze(0) * elite_actions, dim=1
+                ) / (score.sum(0) + 1e-9)
+                _std = T.sqrt(
+                    T.sum(
+                        score.unsqueeze(0)
+                        * (elite_actions - _mean.unsqueeze(1)) ** 2,
+                        dim=1,
+                    )
+                    / (score.sum(0) + 1e-9)
+                )
+                _std = _std.clamp_(self.min_sample_std, self.max_sample_std)
+
+                mean = self.momentum * mean + (1 - self.momentum) * _mean
+                std = _std
+
+            # -------------------------------------------------
+            # Sample an action sequence from the elite distribution
+            # -------------------------------------------------
+
+            score = score.squeeze(1).cpu().numpy()
+            plan = elite_actions[
+                :, np.random.choice(np.arange(score.shape[0]), p=score)
+            ]
+
+            action = plan[0].clone()
+            value = elite_value.max()
+
+            self._warm_start(mean, z0)
+
+            return action, value
+
+class MPPISampler(LatentPlanner):
+
+    def __init__(
+        self,
+        config,
+        model,
+    ):
+
+        super().__init__(config, model)
+
+        self.num_samples = config["MPPI"]["num_candidates"]
+        self.noise_std = config["MPPI"]["noise_std"]
+        self.temperature = config["MPPI"]["temperature"]
+        self.num_opt_iterations = config["MPPI"]["num_opt_iterations"]
+        # Fraction of candidate trajectories seeded from the learned policy.
+        self.mixture_coef = config["MPPI"].get("mixture_coef", 0.0)
+
+    def plan(self, x0, t0=False):
+        """
+        MPPI planning in latent space.
+
+        x0 : (1, obs_dim)
+        t0 : True on the first step of an episode -> reset the warm-started plan
+
+        returns:
+            first action of the optimised plan, and its estimated value
+        """
+
+        with T.no_grad():
+
+            if t0:
+                self.reset()
+
+            z0 = self.model.h(x0)
+
+            # -------------------------------------------------
+            # Policy-seeded (mixture) trajectories
+            # -------------------------------------------------
+
+            num_pi_trajs = int(self.mixture_coef * self.num_samples)
+            pi_actions = self._policy_trajectories(z0, num_pi_trajs)
+
+            z = z0.repeat(self.num_samples + num_pi_trajs, 1)
+
+            for _ in range(self.num_opt_iterations):
+
+                # -------------------------------------------------
+                # Sample noisy action sequences around the nominal plan
+                # -------------------------------------------------
+
+                noise = self.noise_std * T.randn(
+                    self.horizon,
+                    self.num_samples,
+                    self.action_dim,
+                    device=self.device,
+                )
+                actions = (self.nominal_actions.unsqueeze(1) + noise).clamp(
+                    self.lower_action_bound,
+                    self.upper_action_bound,
+                )
+
+                if pi_actions is not None:
+                    actions = T.cat([actions, pi_actions], dim=1)
+
+                # -------------------------------------------------
+                # Evaluate candidates
+                # -------------------------------------------------
+
+                returns, _, _ = self._estimate_value(z, actions)
+                returns = returns.squeeze(1).nan_to_num_(0)
+
+                # -------------------------------------------------
+                # MPPI weights + nominal update
+                # -------------------------------------------------
+
+                beta = returns.max()
+                weights = T.exp((returns - beta) / self.temperature)
+                weights /= weights.sum() + 1e-9
+
+                # Weighted average of the candidate sequences (equivalent to
+                # nominal += sum_k w_k * noise_k, since sum_k w_k == 1).
+                self.nominal_actions = (weights.view(1, -1, 1) * actions).sum(dim=1).clamp(
+                    self.lower_action_bound,
+                    self.upper_action_bound,
+                )
+
+            # -------------------------------------------------
+            # Output + warm start
+            # -------------------------------------------------
+
+            action = self.nominal_actions[0].clone()
+            value = returns.max()
+
+            self._warm_start(self.nominal_actions, z0)
 
             return action, value
 
