@@ -2,14 +2,14 @@ name: TD-MPC (default)
 device: cuda
 
 # Task parameters
-task: walker-run        # dm_control domain-task (e.g. cheetah-run, cartpole-swingup, quadruped-run)
+task: walker-walk        # dm_control domain-task (e.g. cheetah-run, cartpole-swingup, quadruped-run)
 action_repeat: 2         # env steps executed per agent action
 image_observations: False
 
 # Training parameters
 training_algorithm: tdmpc_adaptive
-seed_steps: 5000    #was 5000
-training_steps_per_epoch: 2000
+seed_steps: 5000
+training_steps_per_epoch: 500
 eval_policy_every: 5
 eval_episodes: 5
 train_steps: 30000
@@ -44,8 +44,8 @@ dt_base: null             # seconds per base env step; set at runtime by env.py
                           # dt_scale (conditioning-feature normaliser) is derived
                           # from dt_base and k_max in TOLDAdaptive.__init__.
 k_min: 1                  # min macro-step stride sampled during training
-k_max: 4                  # max macro-step stride (in base env steps) sampled during training
-k_sampling: step         # batch -> one stride per update; sequence -> one per branch; step -> one per (step, branch)
+k_max: 1                  # max macro-step stride (in base env steps) sampled during training
+k_sampling: batch         # batch -> one stride per update; sequence -> one per branch; step -> one per (step, branch)
 plan_k: 1                 # fixed macro-step stride used by the planner
 
 # Sampling planner
@@ -93,7 +93,8 @@ CEM:
   # Momentum on the distribution mean across CEM iterations
   momentum: 0.1
   # Fraction of candidate trajectories seeded from the learned policy
-  mixture_coef: 0.05
+  # mixture_coef: 0.05
+  mixture_coef: 0.0
 
 # ---------------------------------------------------------------------------
 # Entries consumed by tdmpc.py (the original TDMPC / TOLD implementation).

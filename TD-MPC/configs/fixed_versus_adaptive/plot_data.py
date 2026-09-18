@@ -20,6 +20,13 @@ LOSS_METRICS = {
     "metric_total_loss": ("Total Loss", "Total Loss"),
 }
 
+# Diagnostic metrics plotted separately from the losses above (not present for
+# every training run yet, e.g. z_std is only logged by tdmpc_adaptive.py so
+# far, not tdmpc.py -> loaded/plotted only when present).
+OTHER_METRICS = {
+    "metric_z_std": ("Latent Std (z)", "Latent Std"),
+}
+
 
 def load_training_data():
     """
@@ -56,7 +63,7 @@ def load_training_data():
             "steps": data["steps"],
             "rewards": data["training_episode_rewards"],
         }
-        for key in LOSS_METRICS:
+        for key in list(LOSS_METRICS) + list(OTHER_METRICS):
             if key in data.files:
                 record[key] = data[key]
             else:
@@ -126,6 +133,32 @@ def plot_fixed_versus_adaptive(window=25):
 
     fig2.tight_layout()
     fig2.savefig("fixed_versus_adaptive_losses.png", dpi=300)
+
+    # --- Other diagnostics (e.g. latent std) vs steps, only when present ---
+    available_other = [key for key in OTHER_METRICS
+                        if any(key in data for data in experiments.values())]
+
+    if available_other:
+        fig3, axes3 = plt.subplots(len(available_other), 1,
+                                    figsize=(10, 5 * len(available_other)),
+                                    squeeze=False)
+
+        for ax, key in zip(axes3[:, 0], available_other):
+            ylabel, title = OTHER_METRICS[key]
+            for name, data in experiments.items():
+                if key not in data:
+                    print(f"  {name}: skipping {key} plot, not logged for this run")
+                    continue
+                _plot_series(ax, data["steps"], data[key], window, name)
+
+            ax.set_xlabel("Step")
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"{title}: Fixed vs Adaptive dt")
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
+        fig3.tight_layout()
+        fig3.savefig("fixed_versus_adaptive_diagnostics.png", dpi=300)
 
     plt.show()
 

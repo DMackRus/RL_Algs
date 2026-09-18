@@ -2,7 +2,7 @@ name: TD-MPC (default)
 device: cuda
 
 # Task parameters
-task: walker-run         # dm_control domain-task (e.g. cheetah-run, cartpole-swingup, quadruped-run)
+task: walker-walk        # dm_control domain-task (e.g. cheetah-run, cartpole-swingup, quadruped-run)
 action_repeat: 2         # env steps executed per agent action
 image_observations: False
 
@@ -93,7 +93,7 @@ CEM:
   # Momentum on the distribution mean across CEM iterations
   momentum: 0.1
   # Fraction of candidate trajectories seeded from the learned policy
-  mixture_coef: 0.05
+  mixture_coef: 0.0
 
 # ---------------------------------------------------------------------------
 # Entries consumed by tdmpc.py (the original TDMPC / TOLD implementation).
