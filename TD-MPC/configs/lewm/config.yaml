@@ -18,7 +18,7 @@ training_algorithm: lewm
 seed_steps: 5000
 eval_policy_every: 5
 eval_episodes: 5
-train_steps: 50000
+train_steps: 30000
 
 # Replay buffer (uniform sampling: reward-free, no priority signal by default)
 replay_capacity: 1000000

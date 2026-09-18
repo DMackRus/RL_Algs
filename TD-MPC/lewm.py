@@ -37,6 +37,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from goals import goal_observation
+
 
 # ---------------------------------------------------------------------------
 # SIGReg - Sketched Isotropic Gaussian Regularizer.
@@ -244,18 +246,10 @@ class LeWM:
     # -- acting ---------------------------------------------------------
     @torch.no_grad()
     def plan(self, obs, eval_mode=False, step=None, t0=True):
-        if not eval_mode:
-            # Reward-free: training rollouts are pure exploration.
-            if t0:
-                self._walk = np.zeros(self.action_dim, dtype=np.float32)
-            if self.exploration == "brownian":
-                self._walk = np.clip(
-                    self._walk + self.expl_std * np.random.randn(self.action_dim), -1.0, 1.0
-                ).astype(np.float32)
-                a = self._walk
-            else:
-                a = np.random.uniform(-1.0, 1.0, size=self.action_dim).astype(np.float32)
-            return torch.as_tensor(a, dtype=torch.float32, device=self.device)
+
+        # Seed steps - perform random actions to fill replay buffer initially.
+        if step < self.cfg["seed_steps"] and not eval_mode:
+            return torch.empty(self.cfg["action_dim"], dtype=torch.float32, device=self.device).uniform_(-1, 1)
 
         obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         action, _ = self.planner.plan(obs, t0=t0)

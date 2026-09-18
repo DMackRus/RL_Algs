@@ -57,7 +57,18 @@ class TOLDAdaptive(nn.Module):
 	def __init__(self, cfg):
 		super().__init__()
 		self.cfg = cfg
-		self.dt_scale = float(cfg.get("dt_scale", 1.0))   # feature = dt * dt_scale
+		# dt fed to _dt_feat is k * dt_base seconds, k in [1, k_max]. Scale it
+		# so the conditioning feature is normalised to (0, 1] (== k / k_max)
+		# instead of raw seconds, which is a tiny, unnormalised value next to
+		# the O(1) action / latent features it's concatenated with.
+		if cfg.get("dt_base") is None:
+			raise ValueError(
+				"cfg['dt_base'] must be set (by env.make_env) before constructing "
+				"TOLDAdaptive, so dt_scale can be derived from it."
+			)
+		dt_base = float(cfg["dt_base"])
+		k_max = float(cfg.get("k_max", 1))
+		self.dt_scale = 1.0 / (dt_base * k_max)
 
 		# These models are conditioned on delta timestep (dt), ergo one extra input dimension
 		dt_extra = 1
@@ -95,11 +106,6 @@ class TOLDAdaptive(nn.Module):
 
 	def next(self, z, a, dt):
 		"""Predicts next latent state (d) and reward (R).
-
-		dt: physical timestep (seconds) the step advances. Required when
-		cfg['condition_dt'] is set; ignored otherwise. When conditioned, the
-		reward head predicts the return accumulated over that interval, not a
-		single-step reward.
 		"""
 
 		if dt is None:
@@ -246,6 +252,12 @@ class TDMPCAdaptive(nn.Module):
 		zs = [z.detach()]
 
 		consistency_loss, reward_loss, value_loss, priority_loss = 0, 0, 0, 0
+		# Base env steps elapsed before step t (== t when every macro-step has
+		# k=1, recovering the original rho**t). Using elapsed steps instead of
+		# the horizon index means a macro-step of stride k gets discounted by
+		# as many rho factors as the base steps it actually covers, so bigger
+		# timesteps are discounted more, not just deeper horizon positions.
+		elapsed = torch.zeros(z.shape[0], device=z.device, dtype=torch.float32)
 		for t in range(self.cfg["horizon"]):
 
 			# Predictions
@@ -261,11 +273,12 @@ class TDMPCAdaptive(nn.Module):
 			zs.append(z.detach())
 
 			# Losses
-			rho = (self.cfg["rho"] ** t)
+			rho = torch.pow(self.cfg["rho"], elapsed).unsqueeze(-1)
 			consistency_loss += rho * torch.mean(utils.mse(z, next_z), dim=1, keepdim=True)
 			reward_loss += rho * utils.mse(reward_pred, reward[t])
 			value_loss += rho * (utils.mse(Q1, td_target) + utils.mse(Q2, td_target))
 			priority_loss += rho * (utils.l1(Q1, td_target) + utils.l1(Q2, td_target))
+			elapsed = elapsed + (k_t.float() if torch.is_tensor(k_t) else float(k_t))
 
 		# Optimize model
 		total_loss = self.cfg["consistency_loss_weight"] * consistency_loss.clamp(max=1e4) + \

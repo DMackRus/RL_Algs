@@ -193,17 +193,89 @@ class ReplayBuffer():
                 next_obs[t] = self._get_obs(self._obs, base + k[t])
                 r = torch.zeros(B, dtype=torch.float32, device=self.device)
                 a_acc = torch.zeros(B, A, dtype=torch.float32, device=self.device)
-                d = torch.ones(B, dtype=torch.float32, device=self.device)
+                # d = torch.ones(B, dtype=torch.float32, device=self.device)
                 for i in range(k_max):
                     active = (i < k[t]).float()                 # (B,) 1 while i < k
-                    r = r + active * d * self._reward[base + i]
+                    r = r + (active * self._reward[base + i])
                     a_acc = a_acc + active.unsqueeze(1) * self._action[base + i]
-                    d = d * gamma
+                    # d = d * gamma
                 reward[t] = r
                 action[t] = a_acc / k[t].float().unsqueeze(1)   # mean over the window
 
-        if not action.is_cuda:
-            action, reward, idxs, weights = \
-                action.cuda(), reward.cuda(), idxs.cuda(), weights.cuda()
-
         return obs, next_obs, action, reward.unsqueeze(2), idxs, weights, k
+
+    # def sample(self):
+    #     probs = (self._priorities if self._full else self._priorities[:self.idx]) ** self.cfg["per_alpha"]
+    #     probs /= probs.sum()
+    #     total = len(probs)
+    #     idxs = torch.from_numpy(np.random.choice(total, self.cfg["batch_size"], p=probs.cpu().numpy(), replace=not self._full)).to(self.device)
+    #     weights = (total * probs[idxs]) ** (-self.cfg["per_beta"])
+    #     weights /= weights.max()
+
+    #     B, H = self.cfg["batch_size"], self.cfg["horizon"]
+    #     obs = self._get_obs(self._obs, idxs)
+    #     next_obs_shape = self._last_obs.shape[1:] if not self.image_observations else (3*self.cfg["frame_stack"], *self._last_obs.shape[-2:])
+    #     next_obs = torch.empty((H+1, B, *next_obs_shape), dtype=obs.dtype, device=obs.device)
+    #     action = torch.empty((H+1, B, *self._action.shape[1:]), dtype=torch.float32, device=self.device)
+    #     reward = torch.empty((H+1, B), dtype=torch.float32, device=self.device)
+
+    #     if not self.adaptive:
+    #         # Original single-step transitions.
+    #         k = 1
+    #         for t in range(H+1):
+    #             _idxs = idxs + t
+    #             next_obs[t] = self._get_obs(self._obs, _idxs+1)
+    #             action[t] = self._action[_idxs]
+    #             reward[t] = self._reward[_idxs]
+    #         mask = (_idxs+1) % self.cfg["episode_length"] == 0
+    #         next_obs[-1, mask] = self._last_obs[_idxs[mask]//self.cfg["episode_length"]].cuda().float()
+    #     else:
+    #         # Variable macro-step: model step t of branch b spans k[t, b] base env
+    #         # steps, i.e. dt = k[t, b] * dt_base seconds. Over that window:
+    #         #   reward[t]  = discounted return   sum_{i<k} gamma**i * r[base+i]
+    #         #   action[t]  = mean of the k base actions applied in the window
+    #         #   next_obs[t]= obs at base + k[t]  (the window's end)
+    #         # The priority mask in add() reserves (horizon+1)*k_max base steps at
+    #         # each episode end (same self.adaptive gate), so every window stays
+    #         # inside one episode and no terminal fixup is needed.
+    #         #
+    #         # k_sampling controls how much k is allowed to vary:
+    #         #   "batch"    - one stride drawn per sample() call (original behaviour)
+    #         #   "sequence" - one stride per branch, constant along the branch
+    #         #   "step"     - an independent stride for every (t, b)
+    #         k_max, k_min, mode = self.k_max, self.k_min, self.k_sampling
+    #         if mode == "batch":
+    #             k = torch.full((H+1, B), int(np.random.randint(k_min, k_max + 1)),
+    #                            dtype=torch.long, device=self.device)
+    #         elif mode == "sequence":
+    #             k = torch.randint(k_min, k_max + 1, (1, B), device=self.device) \
+    #                     .expand(H+1, B).contiguous()
+    #         elif mode == "step":
+    #             k = torch.randint(k_min, k_max + 1, (H+1, B), device=self.device)
+    #         else:
+    #             raise ValueError(f"unknown k_sampling '{mode}'")
+
+    #         gamma = self.cfg["discount"]
+    #         A = self._action.shape[1]
+    #         # base[t] = idxs + (number of base steps consumed by steps 0..t-1)
+    #         cum = torch.zeros((H+1, B), dtype=torch.long, device=self.device)
+    #         cum[1:] = torch.cumsum(k[:-1], dim=0)
+    #         for t in range(H+1):
+    #             base = idxs + cum[t]
+    #             next_obs[t] = self._get_obs(self._obs, base + k[t])
+    #             r = torch.zeros(B, dtype=torch.float32, device=self.device)
+    #             a_acc = torch.zeros(B, A, dtype=torch.float32, device=self.device)
+    #             d = torch.ones(B, dtype=torch.float32, device=self.device)
+    #             for i in range(k_max):
+    #                 active = (i < k[t]).float()                 # (B,) 1 while i < k
+    #                 r = r + active * d * self._reward[base + i]
+    #                 a_acc = a_acc + active.unsqueeze(1) * self._action[base + i]
+    #                 d = d * gamma
+    #             reward[t] = r
+    #             action[t] = a_acc / k[t].float().unsqueeze(1)   # mean over the window
+
+    #     if not action.is_cuda:
+    #         action, reward, idxs, weights = \
+    #             action.cuda(), reward.cuda(), idxs.cuda(), weights.cuda()
+
+    #     return obs, next_obs, action, reward.unsqueeze(2), idxs, weights, k

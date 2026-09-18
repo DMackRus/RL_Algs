@@ -137,23 +137,27 @@ def evaluate_lewm(env, agent, num_episodes, step, cfg):
     (see goals.py). Returns per-episode (final distance, best distance, success)
     where success == best distance < cfg['goal_success_dist']."""
     thr = float(cfg.get("goal_success_dist", 0.1))
-    finals, bests, succ = [], [], []
+    rewards, finals, bests, succ = [], [], [], []
     for _ in range(num_episodes):
         obs = env.reset()
         goal = goal_observation(env)
         agent.set_goal(goal)
         done, t, best = False, 0, float("inf")
         d = float("inf")
+        ep_reward = 0.0
         while not done:
+
             action = agent.plan(obs, eval_mode=True, step=step, t0=(t == 0))
             obs, _reward, done, _ = env.step(action.cpu().numpy())
+            ep_reward += _reward
             d = float(np.linalg.norm(np.asarray(obs, np.float32) - goal))
             best = min(best, d)
             t += 1
+        rewards.append(ep_reward)
         finals.append(d)
         bests.append(best)
         succ.append(float(best < thr))
-    return finals, bests, succ
+    return rewards, finals, bests, succ
 
 def testing_run(config_filepath):
 
@@ -212,6 +216,9 @@ def testing_run(config_filepath):
 
         obs = env.reset()
         episode = Episode(config, obs)
+        if config["training_algorithm"] == "lewm":
+                goal = goal_observation(env)
+                agent.set_goal(goal)
         while not episode.done:
             action = agent.plan(obs, step=step, t0=episode.first)
             obs, reward, done, _ = env.step(action.cpu().numpy())
@@ -232,7 +239,7 @@ def testing_run(config_filepath):
         # score is carried forward by the logger onto the intervening iterations.
         if step >= config["seed_steps"] and episode_idx % EVAL_EVERY == 0:
             if config["training_algorithm"] == "lewm":
-                finals, bests, succ = evaluate_lewm(env, agent, EVAL_EPISODES, step, config)
+                rewards, finals, bests, succ = evaluate_lewm(env, agent, EVAL_EPISODES, step, config)
                 # Log negative best goal-distance as the "reward" so the existing
                 # plotting lines up; eval_length carries the success rate.
                 eval_reward, eval_length = -float(np.mean(bests)), float(np.mean(succ))
@@ -241,7 +248,8 @@ def testing_run(config_filepath):
                     "goal_dist_best": float(np.mean(bests)),
                     "goal_success_rate": float(np.mean(succ)),
                 })
-                print(f"Step {step}: goal dist (best) {np.mean(bests):.3f}, "
+                print(f"Step {step}: Eval rewards: {np.mean(rewards):.2f}, "
+                      f"goal dist (best) {np.mean(bests):.3f}, "
                       f"final {np.mean(finals):.3f}, success {np.mean(succ):.2f}")
             else:
                 eval_reward, eval_length = evaluate(env, agent, EVAL_EPISODES, step)
@@ -263,21 +271,18 @@ def testing_run(config_filepath):
 
 if __name__ == "__main__":
 
-    # Testing adaptive timestep size
-    # testing_run("configs/fixed_versus_adaptive/adaptive_dt/config.yaml")
     # Testing non adaptive timestep size
     # testing_run("configs/fixed_versus_adaptive/fixed_dt/config.yaml")
+    # Testing adaptive timestep size
+    testing_run("configs/fixed_versus_adaptive/adaptive_dt/config.yaml")
+    
 
     #Just a single testing run
     # testing_run("configs/default/config.yaml")
 
     # LeWorldModel (reward-free JEPA world model, goal-conditioned planning)
-    testing_run("configs/lewm/config.yaml")
+    # testing_run("configs/lewm/config.yaml")
 
-
-
-
-    
 
     # # test_name = "testing_horizons"
     # test_name = "testing_time_lambdas"
