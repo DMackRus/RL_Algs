@@ -5,7 +5,7 @@ from copy import deepcopy
 from planners import PredictiveSampler, MPPISampler, CEMPlanner, CEMPlannerHierarchical, CEMPlannerMultistep, PolicyPlanner
 
 import utils
-from utils import set_requires_grad, enc, mlp, q, orthogonal_init, NormalizeImg, Flatten, TruncatedNormal
+from utils import set_requires_grad, enc, mlp, q, v, orthogonal_init, NormalizeImg, Flatten, TruncatedNormal
 
 class TOLD(nn.Module):
 	"""Task-Oriented Latent Dynamics (TOLD) model used in TD-MPC."""
@@ -17,6 +17,7 @@ class TOLD(nn.Module):
 		self._reward = mlp(cfg["latent_dim"]+cfg["action_dim"], cfg["mlp_dim"], 1)
 		self._pi = mlp(cfg["latent_dim"], cfg["mlp_dim"], cfg["action_dim"])
 		self._Q1, self._Q2 = q(cfg), q(cfg)
+		# self._V1, self._V2 = v(cfg), v(cfg)
 		self.apply(utils.orthogonal_init)
 		for m in [self._reward, self._Q1, self._Q2]:
 			m[-1].weight.data.fill_(0)
@@ -48,6 +49,10 @@ class TOLD(nn.Module):
 		"""Predict state-action value (Q)."""
 		x = torch.cat([z, a], dim=-1)
 		return self._Q1(x), self._Q2(x)
+
+	def V(self, z):
+		"""Predict state value (V)."""
+		return self._V1(z), self._V2(z)
 
 class TDMPC():
 	"""Implementation of TD-MPC learning + inference."""
@@ -129,6 +134,21 @@ class TDMPC():
 			torch.min(*self.model_target.Q(next_z, self.model.pi(next_z, self.cfg["min_std"])))
 		return td_target
 
+	# @torch.no_grad()
+	# def _td_target(self, next_obs, reward):
+	# 	"""Compute the TD-target from a (k-step) reward and the observation k base
+	# 	steps later. reward is the discounted return over the macro-step, so the
+	# 	bootstrap term is discounted by gamma**k. k may be a scalar or a per-branch
+	# 	(batch,) tensor of strides."""
+
+	# 	next_z = self.model.h(next_obs)
+	# 	# discount = self.cfg["discount"] ** k
+	# 	discount = self.cfg["discount"]
+	# 	if torch.is_tensor(discount):
+	# 		discount = discount.to(reward.device, reward.dtype).view(-1, 1)
+	# 	td_target = reward + discount * torch.min(*self.model_target.V(next_z))
+	# 	return td_target
+
 	def update(self, replay_buffer, step):
 		"""Main update function. Corresponds to one iteration of the TOLD model learning."""
 		obs, next_obses, action, reward, idxs, weights, _ = replay_buffer.sample()
@@ -145,6 +165,7 @@ class TDMPC():
 
 			# Predictions
 			Q1, Q2 = self.model.Q(z, action[t])
+			# V1, V2 = self.model.V(z)
 			z, reward_pred = self.model.next(z, action[t])
 			with torch.no_grad():
 				next_obs = self.aug(next_obses[t])
@@ -158,6 +179,8 @@ class TDMPC():
 			reward_loss += rho * utils.mse(reward_pred, reward[t])
 			value_loss += rho * (utils.mse(Q1, td_target) + utils.mse(Q2, td_target))
 			priority_loss += rho * (utils.l1(Q1, td_target) + utils.l1(Q2, td_target))
+			# value_loss += rho * (utils.mse(V1, td_target) + utils.mse(V2, td_target))
+			# priority_loss += rho * (utils.l1(V1, td_target) + utils.l1(V2, td_target))
 
 		# Optimize model
 		total_loss = self.cfg["consistency_loss_weight"] * consistency_loss.clamp(max=1e4) + \
@@ -172,8 +195,11 @@ class TDMPC():
 
 		# Update policy + target network
 		pi_loss = self.update_pi(zs)
+		# pi_loss = 0.0
 		if step % self.cfg["update_freq"] == 0:
 			utils.ema(self.model, self.model_target, self.cfg["tau"])
+
+		z_std = torch.std(z, dim=0)
 
 		self.model.eval()
 		return {'consistency_loss': float(consistency_loss.mean().item()),
@@ -182,4 +208,5 @@ class TDMPC():
 				'pi_loss': pi_loss,
 				'total_loss': float(total_loss.mean().item()),
 				'weighted_loss': float(weighted_loss.mean().item()),
-				'grad_norm': float(grad_norm)}
+				'grad_norm': float(grad_norm),
+				'z_std': float(z_std.mean().item())}

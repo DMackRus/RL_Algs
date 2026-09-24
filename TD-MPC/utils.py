@@ -83,6 +83,12 @@ def q(cfg, act_fn=nn.ELU()):
 						 nn.Linear(cfg["mlp_dim"], cfg["mlp_dim"]), nn.ELU(),
 						 nn.Linear(cfg["mlp_dim"], 1))
 
+def v(cfg, act_fn=nn.ELU()):
+	"""Returns a V-function that uses Layer Normalization."""
+	return nn.Sequential(nn.Linear(cfg["latent_dim"], cfg["mlp_dim"]), nn.LayerNorm(cfg["mlp_dim"]), nn.Tanh(),
+						 nn.Linear(cfg["mlp_dim"], cfg["mlp_dim"]), nn.ELU(),
+						 nn.Linear(cfg["mlp_dim"], 1))
+
 def set_requires_grad(net, value):
 	"""Enable/disable gradients for a given (sub)network."""
 	for param in net.parameters():

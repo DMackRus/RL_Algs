@@ -8,7 +8,7 @@ from torch.distributions.utils import _standard_normal
 from planners import PredictiveSampler, MPPISampler, CEMPlanner, CEMPlannerHierarchical, CEMPlannerMultistep, PolicyPlanner
 
 import utils
-from utils import set_requires_grad, enc, mlp, q
+from utils import set_requires_grad, enc, mlp, q, v
 
 class TruncatedNormal(pyd.Normal):
 	"""Utility class implementing the truncated normal distribution."""
@@ -77,8 +77,10 @@ class TOLDAdaptive(nn.Module):
 		self._reward = mlp(cfg["latent_dim"]+cfg["action_dim"]+dt_extra, cfg["mlp_dim"], 1)
 		self._pi = mlp(cfg["latent_dim"], cfg["mlp_dim"], cfg["action_dim"])
 		self._Q1, self._Q2 = q(cfg), q(cfg)
+		self._V1, self._V2 = v(cfg), v(cfg)
 		self.apply(utils.orthogonal_init)
 		for m in [self._reward, self._Q1, self._Q2]:
+		# for m in [self._reward, self._V1, self._V2]:
 			m[-1].weight.data.fill_(0)
 			m[-1].bias.data.fill_(0)
 
@@ -117,9 +119,7 @@ class TOLDAdaptive(nn.Module):
 			feats.append(dt_feat)
 		x = torch.cat(feats, dim=-1)
 
-		# Dynamics  using Euler Integration: z_{t+1} = z_t + f(z_t, a_t) * dt
-		dz = self._dynamics(x)
-		z_next = z + (dz * dt)
+		z_next = self._dynamics(x)
 
 		return z_next, self._reward(x)
 
@@ -135,6 +135,10 @@ class TOLDAdaptive(nn.Module):
 		"""Predict state-action value (Q)."""
 		x = torch.cat([z, a], dim=-1)
 		return self._Q1(x), self._Q2(x)
+
+	def V(self, z):
+		"""Predict state value (V)."""
+		return self._V1(z), self._V2(z)
 
 class TDMPCAdaptive(nn.Module):
 	"""Implementation of TD-MPC learning + inference."""
@@ -233,6 +237,21 @@ class TDMPCAdaptive(nn.Module):
 			torch.min(*self.model_target.Q(next_z, self.model.pi(next_z, self.cfg["min_std"])))
 		return td_target
 
+	# @torch.no_grad()
+	# def _td_target(self, next_obs, reward, k=1):
+	# 	"""Compute the TD-target from a (k-step) reward and the observation k base
+	# 	steps later. reward is the discounted return over the macro-step, so the
+	# 	bootstrap term is discounted by gamma**k. k may be a scalar or a per-branch
+	# 	(batch,) tensor of strides."""
+
+	# 	next_z = self.model.h(next_obs)
+	# 	# discount = self.cfg["discount"] ** k
+	# 	discount = self.cfg["discount"]
+	# 	if torch.is_tensor(discount):
+	# 		discount = discount.to(reward.device, reward.dtype).view(-1, 1)
+	# 	td_target = reward + discount * torch.min(*self.model_target.V(next_z))
+	# 	return td_target
+
 	def update(self, replay_buffer, step):
 		"""Main update function. Corresponds to one iteration of the TOLD model learning."""
 		obs, next_obses, action, reward, idxs, weights, k = replay_buffer.sample()
@@ -257,7 +276,7 @@ class TDMPCAdaptive(nn.Module):
 		# the horizon index means a macro-step of stride k gets discounted by
 		# as many rho factors as the base steps it actually covers, so bigger
 		# timesteps are discounted more, not just deeper horizon positions.
-		elapsed = torch.zeros(z.shape[0], device=z.device, dtype=torch.float32)
+		# elapsed = torch.zeros(z.shape[0], device=z.device, dtype=torch.float32)
 		for t in range(self.cfg["horizon"]):
 
 			# Predictions
@@ -265,6 +284,7 @@ class TDMPCAdaptive(nn.Module):
 			dt_t = dt[t].unsqueeze(-1) if torch.is_tensor(dt) else dt
 			k_t = k[t] if torch.is_tensor(k) else k
 			Q1, Q2 = self.model.Q(z, action[t])
+			# V1, V2 = self.model.V(z)
 			z, reward_pred = self.model.next(z, action[t], dt_t)
 			with torch.no_grad():
 				next_obs = self.aug(next_obses[t])
@@ -273,12 +293,15 @@ class TDMPCAdaptive(nn.Module):
 			zs.append(z.detach())
 
 			# Losses
-			rho = torch.pow(self.cfg["rho"], elapsed).unsqueeze(-1)
+			# rho = torch.pow(self.cfg["rho"], elapsed).unsqueeze(-1)
+			rho = self.cfg["rho"] ** t
 			consistency_loss += rho * torch.mean(utils.mse(z, next_z), dim=1, keepdim=True)
 			reward_loss += rho * utils.mse(reward_pred, reward[t])
 			value_loss += rho * (utils.mse(Q1, td_target) + utils.mse(Q2, td_target))
 			priority_loss += rho * (utils.l1(Q1, td_target) + utils.l1(Q2, td_target))
-			elapsed = elapsed + (k_t.float() if torch.is_tensor(k_t) else float(k_t))
+			# value_loss += rho * (utils.mse(V1, td_target) + utils.mse(V2, td_target))
+			# priority_loss += rho * (utils.l1(V1, td_target) + utils.l1(V2, td_target))
+			# elapsed = elapsed + (k_t.float() if torch.is_tensor(k_t) else float(k_t))
 
 		# Optimize model
 		total_loss = self.cfg["consistency_loss_weight"] * consistency_loss.clamp(max=1e4) + \
@@ -293,8 +316,11 @@ class TDMPCAdaptive(nn.Module):
 
 		# Update policy + target network
 		pi_loss = self.update_pi(zs)
+		# pi_loss = 0.0
 		if step % self.cfg["update_freq"] == 0:
 			utils.ema(self.model, self.model_target, self.cfg["tau"])
+
+		z_std = torch.std(z, dim=0)
 
 		self.model.eval()
 		return {'consistency_loss': float(consistency_loss.mean().item()),
@@ -303,4 +329,5 @@ class TDMPCAdaptive(nn.Module):
 				'pi_loss': pi_loss,
 				'total_loss': float(total_loss.mean().item()),
 				'weighted_loss': float(weighted_loss.mean().item()),
-				'grad_norm': float(grad_norm)}
+				'grad_norm': float(grad_norm),
+				'z_std': float(z_std.mean().item())}

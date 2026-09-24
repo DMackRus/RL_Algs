@@ -151,11 +151,26 @@ class LatentPlanner:
             G += discount * self.goal_reward_coef * match
             end_value = discount * self.goal_reward_coef * match
         else:
-            # Coarsest stage: learned terminal value estimate.
+            #TODO - hardcoded for now
+            # V_term = T.min(*self.model.V(z))
+            # G += discount * V_term
+            # end_value = discount * V_term
             terminal_action = self.model.pi(z, self.min_std)
             q_term = T.min(*self.model.Q(z, terminal_action))
             G += discount * q_term
             end_value = discount * q_term
+
+            # if self.adaptive_dt:
+            #     # Coarsest stage: learned terminal value estimate.
+            #     V_term = T.min(*self.model.V(z))
+            #     G += discount * V_term
+            #     end_value = discount * V_term
+            # else:
+            #     # Coarsest stage: learned terminal value estimate.
+            #     terminal_action = self.model.pi(z, self.min_std)
+            #     q_term = T.min(*self.model.Q(z, terminal_action))
+            #     G += discount * q_term
+            #     end_value = discount * q_term
 
         return G, end_value, reward_sum
 
@@ -195,6 +210,21 @@ class LatentPlanner:
         j = (k_next * horizon) // k_prev
         j = int(min(j, latents.shape[0] - 1))
         return latents[j:j + 1]
+
+    # def _warm_start(self, plan, z0):
+    #     shifted = T.zeros_like(plan)
+    #     shifted[:-1] = plan[1:].clone()
+
+    #     # HARDCODED - test always cloning last control
+    #     # shifted[-1] = plan[-1].clone()
+
+    #     if self.adaptive_dt:
+    #         # No actor in the V-only model — repeat the last action instead of
+    #         # asking a policy network for one.
+    #         shifted[-1] = plan[-1].clone()
+    #     else:
+    #         shifted[-1] = self.model.pi(z0, self.min_std).squeeze(0)
+    #     self.nominal_actions = shifted
 
     def _warm_start(self, plan, z0):
         """

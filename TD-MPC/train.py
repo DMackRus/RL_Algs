@@ -32,9 +32,10 @@ class Logger:
       - ``training_stats.npz`` all history as numpy arrays for offline plotting
     """
 
-    def __init__(self, work_dir, cfg):
+    def __init__(self, work_dir, cfg, seed):
         self.work_dir = work_dir
         self.cfg = cfg
+        self.seed = seed
         os.makedirs(work_dir, exist_ok=True)
         self.log_file = os.path.join(work_dir, "log.txt")
 
@@ -97,7 +98,7 @@ class Logger:
         with open(self.log_file, "w") as f:
             f.write("\n".join(lines) + "\n")
 
-    def save(self, filename="training_stats.npz"):
+    def save(self, filename="training_stats"):
         """Dump all collected history to a ``.npz`` for offline plotting."""
         arrays = dict(
             iterations=np.array(self.iterations),
@@ -110,7 +111,7 @@ class Logger:
         )
         for key, values in self.metrics.items():
             arrays[f"metric_{key}"] = np.array(values)
-        np.savez(os.path.join(self.work_dir, filename), **arrays)
+        np.savez(os.path.join(self.work_dir, f"{filename}_{self.seed}.npz"), **arrays)
 
 
 @T.no_grad()
@@ -159,6 +160,13 @@ def evaluate_lewm(env, agent, num_episodes, step, cfg):
         succ.append(float(best < thr))
     return rewards, finals, bests, succ
 
+def set_seed(seed):
+    """Set the random seed for reproducibility."""
+    np.random.seed(seed)
+    T.manual_seed(seed)
+    if T.cuda.is_available():
+        T.cuda.manual_seed_all(seed)
+
 def testing_run(config_filepath):
 
     # Load the config yaml file
@@ -190,91 +198,115 @@ def testing_run(config_filepath):
     print(f"Env episode length: {config['episode_length']}")
 
     print(f"Training with config: {config['training_algorithm']}")
-    agent = None
-    if config["training_algorithm"] == "tdmpc":
-        # Make a TDMPC object
-        agent = TDMPC(config)
-    elif config["training_algorithm"] == "sac":
-        raise NotImplementedError("SAC training not yet implemented.")
-    elif config["training_algorithm"] == "tdmpc_adaptive":
-        agent = TDMPCAdaptive(config)
-    elif config["training_algorithm"] == "lewm":
-        agent = LeWM(config)
-    else:
-        raise ValueError(f"Unknown training algorithm: {config['training_algorithm']}")
+    # agent = None
+    # if config["training_algorithm"] == "tdmpc":
+    #     # Make a TDMPC object
+    #     agent = TDMPC(config)
+    # elif config["training_algorithm"] == "sac":
+    #     raise NotImplementedError("SAC training not yet implemented.")
+    # elif config["training_algorithm"] == "tdmpc_adaptive":
+    #     agent = TDMPCAdaptive(config)
+    # elif config["training_algorithm"] == "lewm":
+    #     agent = LeWM(config)
+    # else:
+    #     raise ValueError(f"Unknown training algorithm: {config['training_algorithm']}")
 
     # Instantiate the replay buffer (prioritized experience replay by default)
-    replay_buffer = ReplayBuffer(
-        config
-    )
-
-    logger = Logger(folder_path, config)
+    
 
     print("Training starts...")
-    episode_idx = 0
-    for step in range(0, config["train_steps"]+config["episode_length"], config["episode_length"]):
 
-        obs = env.reset()
-        episode = Episode(config, obs)
-        if config["training_algorithm"] == "lewm":
-                goal = goal_observation(env)
-                agent.set_goal(goal)
-        while not episode.done:
-            action = agent.plan(obs, step=step, t0=episode.first)
-            obs, reward, done, _ = env.step(action.cpu().numpy())
-            episode += (obs, action, reward, done)
-        assert len(episode) == config["episode_length"]
-        replay_buffer += episode
+    for seed in range(config.get("num_seeds", 1)):
+        episode_idx = 0
+        replay_buffer = ReplayBuffer(
+            config
+        )
+        logger = Logger(folder_path, config, seed=seed)
+        agent = None
+        if config["training_algorithm"] == "tdmpc":
+            # Make a TDMPC object
+            agent = TDMPC(config)
+        elif config["training_algorithm"] == "sac":
+            raise NotImplementedError("SAC training not yet implemented.")
+        elif config["training_algorithm"] == "tdmpc_adaptive":
+            agent = TDMPCAdaptive(config)
+        elif config["training_algorithm"] == "lewm":
+            agent = LeWM(config)
+        else:
+            raise ValueError(f"Unknown training algorithm: {config['training_algorithm']}")
 
-        print(f"Step {step}: Collected episode with reward {episode.cumulative_reward:.2f} and length {len(episode)}")
+        for step in range(0, config["train_steps"]+config["episode_length"], config["episode_length"]):
 
-        # Update the models
-        train_metrics = {}
-        if step >= config["seed_steps"]:
-            num_updates = config["seed_steps"] if step == config["seed_steps"] else config["episode_length"]
-            for i in range(num_updates):
-                train_metrics.update(agent.update(replay_buffer, step+i))
-
-        # Evaluate the current policy periodically (noise-free planning). The
-        # score is carried forward by the logger onto the intervening iterations.
-        if step >= config["seed_steps"] and episode_idx % EVAL_EVERY == 0:
+            obs = env.reset()
+            episode = Episode(config, obs)
             if config["training_algorithm"] == "lewm":
-                rewards, finals, bests, succ = evaluate_lewm(env, agent, EVAL_EPISODES, step, config)
-                # Log negative best goal-distance as the "reward" so the existing
-                # plotting lines up; eval_length carries the success rate.
-                eval_reward, eval_length = -float(np.mean(bests)), float(np.mean(succ))
-                train_metrics.update({
-                    "goal_dist_final": float(np.mean(finals)),
-                    "goal_dist_best": float(np.mean(bests)),
-                    "goal_success_rate": float(np.mean(succ)),
-                })
-                print(f"Step {step}: Eval rewards: {np.mean(rewards):.2f}, "
-                      f"goal dist (best) {np.mean(bests):.3f}, "
-                      f"final {np.mean(finals):.3f}, success {np.mean(succ):.2f}")
-            else:
-                eval_reward, eval_length = evaluate(env, agent, EVAL_EPISODES, step)
-                print(f"Step {step}: eval reward over {EVAL_EPISODES} episodes: {eval_reward:.2f}")
-            logger.set_eval(eval_reward, eval_length)
+                    goal = goal_observation(env)
+                    agent.set_goal(goal)
+            while not episode.done:
+                action = agent.plan(obs, step=step, t0=episode.first)
+                obs, reward, done, _ = env.step(action.cpu().numpy())
+                episode += (obs, action, reward, done)
+            assert len(episode) == config["episode_length"]
+            replay_buffer += episode
 
-            os.makedirs(f"{folder_path}/model_checkpoints", exist_ok=True)
-            agent.save(f"{folder_path}/model_checkpoints/checkpoint_step{step}.pt")
+            print(f"Step {step}: Collected episode with reward {episode.cumulative_reward:.2f} and length {len(episode)}")
 
-        # Record this iteration: training reward/length, carried-forward eval
-        # reward/length, and the latest update metrics (NaN during seed phase).
-        logger.log_iteration(episode_idx, step, episode, train_metrics)
+            # Update the models
+            train_metrics = {}
+            if step >= config["seed_steps"]:
+                num_updates = config["seed_steps"] if step == config["seed_steps"] else config["episode_length"]
+                for i in range(num_updates):
+                    train_metrics.update(agent.update(replay_buffer, step+i))
+
+            # Evaluate the current policy periodically (noise-free planning). The
+            # score is carried forward by the logger onto the intervening iterations.
+            if step >= config["seed_steps"] and episode_idx % EVAL_EVERY == 0:
+                if config["training_algorithm"] == "lewm":
+                    rewards, finals, bests, succ = evaluate_lewm(env, agent, EVAL_EPISODES, step, config)
+                    # Log negative best goal-distance as the "reward" so the existing
+                    # plotting lines up; eval_length carries the success rate.
+                    eval_reward, eval_length = -float(np.mean(bests)), float(np.mean(succ))
+                    train_metrics.update({
+                        "goal_dist_final": float(np.mean(finals)),
+                        "goal_dist_best": float(np.mean(bests)),
+                        "goal_success_rate": float(np.mean(succ)),
+                    })
+                    print(f"Step {step}: Eval rewards: {np.mean(rewards):.2f}, "
+                        f"goal dist (best) {np.mean(bests):.3f}, "
+                        f"final {np.mean(finals):.3f}, success {np.mean(succ):.2f}")
+                else:
+                    eval_reward, eval_length = evaluate(env, agent, EVAL_EPISODES, step)
+                    print(f"Step {step}: eval reward over {EVAL_EPISODES} episodes: {eval_reward:.2f}")
+                logger.set_eval(eval_reward, eval_length)
+
+                os.makedirs(f"{folder_path}/model_checkpoints", exist_ok=True)
+                agent.save(f"{folder_path}/model_checkpoints/checkpoint_step{step}.pt")
+
+            # Record this iteration: training reward/length, carried-forward eval
+            # reward/length, and the latest update metrics (NaN during seed phase).
+            logger.log_iteration(episode_idx, step, episode, train_metrics)
+            logger.save()
+
+            episode_idx += 1
+
         logger.save()
-
-        episode_idx += 1
-
-    logger.save()
     # env.close()
 
 if __name__ == "__main__":
 
-    # Testing non adaptive timestep size
     # testing_run("configs/fixed_versus_adaptive/fixed_dt/config.yaml")
-    # Testing adaptive timestep size
-    testing_run("configs/fixed_versus_adaptive/adaptive_dt/config.yaml")
+    # testing_run("configs/fixed_versus_adaptive/fixed_q_model/config.yaml")
+
+    # testing_run("configs/fixed_versus_adaptive/adaptive_dt/config.yaml")
+    # testing_run("configs/fixed_versus_adaptive/adaptive_q_model/config.yaml")
+    # testing_run("configs/fixed_versus_adaptive/adaptive_k=1-4/config.yaml")
+    testing_run("configs/fixed_versus_adaptive/fixed_increased_budget/config.yaml")
+
+
+    # testing_run("configs/fixed_versus_adaptive/adaptive_batched_dt/config.yaml")
+    # testing_run("configs/fixed_versus_adaptive/adaptive_average_action/config.yaml")
+    # testing_run("configs/fixed_versus_adaptive/adaptive_no_discount_AR/config.yaml")
+    # testing_run("configs/fixed_versus_adaptive/adaptive_code_k=1/config.yaml")
     
 
     #Just a single testing run

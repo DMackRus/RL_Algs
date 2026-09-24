@@ -252,7 +252,7 @@ class MetaWorldEnv:
 def _make_dmc(cfg):
 	"""dm_control suite. Adapted from https://github.com/facebookresearch/drqv2"""
 	domain, task = cfg["task"].replace('-', '_').split('_', 1)
-	domain = dict(cup='ball_in_cup').get(domain, domain)
+	domain = dict(cup='ball_in_cup', pointmass='point_mass').get(domain, domain)
 	assert (domain, task) in suite.ALL_TASKS, f"unknown dm_control task: {domain} {task}"
 
 	env = suite.load(domain,

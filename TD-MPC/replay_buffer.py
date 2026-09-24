@@ -158,6 +158,37 @@ class ReplayBuffer():
             mask = (_idxs+1) % self.cfg["episode_length"] == 0
             next_obs[-1, mask] = self._last_obs[_idxs[mask]//self.cfg["episode_length"]].cuda().float()
         else:
+
+
+
+            # Variable macro-step: each model step spans k base env steps.
+            # A single k is drawn per batch. reward[t] is the discounted return
+            # accumulated over the window; action[t] is the window's first action
+            # (assumed held constant). The priority mask in add() guarantees the
+            # whole window stays inside one episode, so no terminal fixup is needed.
+        #     k = int(np.random.randint(1, self.cfg.get("k_max", 4) + 1))
+        #     gamma = self.cfg["discount"]
+        #     for t in range(H+1):
+        #         base = idxs + t * k
+        #         next_obs[t] = self._get_obs(self._obs, base + k)
+        #         action[t] = self._action[base]
+        #         r = torch.zeros(B, dtype=torch.float32, device=self.device)
+        #         d = 1.0
+        #         for i in range(k):
+        #             r = r + d * self._reward[base + i]
+        #             d *= gamma
+        #         reward[t] = r
+
+        # if not action.is_cuda:
+        #     action, reward, idxs, weights = \
+        #         action.cuda(), reward.cuda(), idxs.cuda(), weights.cuda()
+
+        # return obs, next_obs, action, reward.unsqueeze(2), idxs, weights, k
+
+
+
+
+
             # Variable macro-step: model step t of branch b spans k[t, b] base env
             # steps, i.e. dt = k[t, b] * dt_base seconds. Over that window:
             #   reward[t]  = discounted return   sum_{i<k} gamma**i * r[base+i]
@@ -193,10 +224,12 @@ class ReplayBuffer():
                 next_obs[t] = self._get_obs(self._obs, base + k[t])
                 r = torch.zeros(B, dtype=torch.float32, device=self.device)
                 a_acc = torch.zeros(B, A, dtype=torch.float32, device=self.device)
-                # d = torch.ones(B, dtype=torch.float32, device=self.device)
+                # action[t] = self._action[base]  # Use the first action in the window as the representative action
+                d = torch.ones(B, dtype=torch.float32, device=self.device)
                 for i in range(k_max):
                     active = (i < k[t]).float()                 # (B,) 1 while i < k
-                    r = r + (active * self._reward[base + i])
+                    # r = r + active * d * self._reward[base + i]
+                    r = r + active * self._reward[base + i]
                     a_acc = a_acc + active.unsqueeze(1) * self._action[base + i]
                     # d = d * gamma
                 reward[t] = r

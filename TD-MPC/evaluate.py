@@ -31,9 +31,9 @@ def main():
 
 if __name__ == "__main__":
 
-    # test_folder = "configs/fixed_versus_adaptive/adaptive_dt"      # Adaptive timestep size
+    test_folder = "configs/fixed_versus_adaptive/adaptive_dt"      # Adaptive timestep size
     # test_folder = "configs/lewm"      # LeWorldModel (goal-conditioned, reward-free)
-    test_folder = "configs/default"
+    # test_folder = "configs/default"
     yaml_name = "config.yaml"
     model_name = "checkpoint_step30000.pt"
     video_folder_name = "eval_videos"

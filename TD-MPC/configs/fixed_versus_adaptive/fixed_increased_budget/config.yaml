@@ -9,7 +9,7 @@ image_observations: False
 # Training parameters
 training_algorithm: tdmpc
 seed_steps: 5000    #was 5000
-training_steps_per_epoch: 500
+training_steps_per_epoch: 2000
 eval_policy_every: 5
 eval_episodes: 5
 train_steps: 30000

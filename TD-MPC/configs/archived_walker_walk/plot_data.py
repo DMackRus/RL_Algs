@@ -91,7 +91,7 @@ def _plot_series(ax, steps, values, window, label):
     ax.plot(steps, values, alpha=0.15, color=line.get_color())
 
 
-def plot_fixed_versus_adaptive(window=5):
+def plot_fixed_versus_adaptive(window=25):
     experiments = load_training_data()
 
     if len(experiments) == 0:
@@ -164,7 +164,7 @@ def plot_fixed_versus_adaptive(window=5):
 
 
 def main():
-    plot_fixed_versus_adaptive(window=5)
+    plot_fixed_versus_adaptive(window=25)
 
 
 if __name__ == "__main__":
