@@ -294,20 +294,12 @@ def testing_run(config_filepath):
 
 if __name__ == "__main__":
 
-    # testing_run("configs/fixed_versus_adaptive/fixed_dt/config.yaml")
-    # testing_run("configs/fixed_versus_adaptive/fixed_q_model/config.yaml")
-
-    # testing_run("configs/fixed_versus_adaptive/adaptive_dt/config.yaml")
-    # testing_run("configs/fixed_versus_adaptive/adaptive_q_model/config.yaml")
-    # testing_run("configs/fixed_versus_adaptive/adaptive_k=1-4/config.yaml")
+    testing_run("configs/fixed_versus_adaptive/fixed_dt/config.yaml")
     testing_run("configs/fixed_versus_adaptive/fixed_increased_budget/config.yaml")
-
-
-    # testing_run("configs/fixed_versus_adaptive/adaptive_batched_dt/config.yaml")
-    # testing_run("configs/fixed_versus_adaptive/adaptive_average_action/config.yaml")
-    # testing_run("configs/fixed_versus_adaptive/adaptive_no_discount_AR/config.yaml")
-    # testing_run("configs/fixed_versus_adaptive/adaptive_code_k=1/config.yaml")
-    
+    testing_run("configs/fixed_versus_adaptive/adaptive_k=1-2/config.yaml")
+    testing_run("configs/fixed_versus_adaptive/adaptive_k=1-4/config.yaml")
+    testing_run("configs/fixed_versus_adaptive/adaptive_k=1-8/config.yaml")
+    testing_run("configs/fixed_versus_adaptive/adaptive_k=1-16/config.yaml")
 
     #Just a single testing run
     # testing_run("configs/default/config.yaml")
