@@ -13,32 +13,17 @@ LeWM is a *reward-free* JEPA world model:
                                           autoregressive transformer collapses
                                           to a Markov step for state inputs)
 
-trained end-to-end - *no* target encoder, *no* EMA, *no* stop-gradient - on
-
       L = ||f(z_t, a_t) - h(o_{t+1})||^2   +   lambda * SIGReg({z})
 
-where SIGReg (Sketched Isotropic Gaussian Regularizer, verbatim from the
-reference) is the single anti-collapse term: it pushes the batch of embeddings
+where SIGReg (Sketched Isotropic Gaussian Regularizer)
+is the single anti-collapse term: it pushes the batch of embeddings
 towards an isotropic Gaussian via random 1-D projections and the Epps-Pulley
 normality statistic.
-
-There is no reward head, no value function and no policy. At evaluation the
-world model stays in the loop for goal-conditioned planning: CEM over action
-sequences, minimising the latent distance between the rolled-out endpoint and a
-goal embedding z_g = h(o_g). Goal observations come from ``goals.py``.
-
-Training data is collected with *pure exploratory actions* (uniform or a
-Brownian random walk) - ``plan()`` only does goal-conditioned planning in
-``eval_mode``.
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from goals import goal_observation
-
 
 # ---------------------------------------------------------------------------
 # SIGReg - Sketched Isotropic Gaussian Regularizer.
@@ -79,8 +64,8 @@ class LeWMModel(nn.Module):
         state_dim = int(cfg["state_dim"])
         latent = int(cfg["latent_dim"])
         act_dim = int(cfg["action_dim"])
-        enc_hidden = int(cfg.get("lewm_enc_dim", cfg.get("enc_dim", 256)))
-        pred_hidden = int(cfg.get("lewm_mlp_dim", cfg.get("mlp_dim", 512)))
+        enc_hidden = int(cfg.get("enc_dim", 256))
+        pred_hidden = int(cfg.get("mlp_dim", 512))
 
         self._trunk = nn.Sequential(
             nn.Linear(state_dim, enc_hidden), nn.ELU(),
@@ -111,7 +96,7 @@ class LeWMModel(nn.Module):
 
 # ---------------------------------------------------------------------------
 # Goal-conditioned CEM planner. Cost = latent distance to the goal embedding.
-# No reward / value / policy terms (contrast planners.LatentPlanner).
+# No reward / value / policy terms.
 # ---------------------------------------------------------------------------
 
 class GoalCEMPlanner:
@@ -194,34 +179,29 @@ class GoalCEMPlanner:
 
 
 # ---------------------------------------------------------------------------
-# Agent. Same surface as TDMPC (plan / update / save / load) so train.py can
-# drive it, plus set_goal() for the goal-conditioned evaluation.
+# Agent: plan / update / save / load, plus set_goal() for goal-conditioned
+# planning.
 # ---------------------------------------------------------------------------
 
 class LeWM:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.device = torch.device("cuda")
+        self.device = torch.device(cfg["device"])
         self.horizon = int(cfg["horizon"])
         self.action_dim = int(cfg["action_dim"])
 
-        self.model = LeWMModel(cfg).cuda()
+        self.model = LeWMModel(cfg).to(self.device)
         self.sigreg = SIGReg(
             knots=int(cfg.get("sigreg_knots", 17)),
             num_proj=int(cfg.get("sigreg_num_proj", 1024)),
-        ).cuda()
+        ).to(self.device)
         self.optim = torch.optim.Adam(self.model.parameters(), lr=float(cfg["lr"]))
 
         self.lambd = float(cfg.get("sigreg_weight", 0.1))
         self.grad_clip_norm = float(cfg.get("grad_clip_norm", 10.0))
-        self.prioritized = bool(cfg.get("lewm_prioritized", False))
+        self.prioritized = bool(cfg.get("prioritized_replay", False))
 
         self.planner = GoalCEMPlanner(cfg, self.model)
-
-        # Exploratory data collection.
-        self.exploration = str(cfg.get("exploration", "uniform")).lower()
-        self.expl_std = float(cfg.get("expl_std", 0.3))
-        self._walk = np.zeros(self.action_dim, dtype=np.float32)
 
         self.model.eval()
 
@@ -241,7 +221,7 @@ class LeWM:
         torch.save(self.state_dict(), fp)
 
     def load(self, fp):
-        self.model.load_state_dict(torch.load(fp)["model"])
+        self.model.load_state_dict(torch.load(fp, map_location=self.device)["model"])
 
     # -- acting ---------------------------------------------------------
     @torch.no_grad()
@@ -257,13 +237,13 @@ class LeWM:
 
     # -- learning -----------------------------------------------------
     def update(self, replay_buffer, step):
-        obs, next_obses, action, _reward, idxs, weights, _ = replay_buffer.sample()
+        obs, next_obses, action, idxs, _weights = replay_buffer.sample()
         H, B = self.horizon, obs.shape[0]
 
         self.model.train()
 
         # Observation sequence o_0..o_H  -> embeddings z_0..z_H (joint grad).
-        obs_seq = torch.cat([obs.unsqueeze(0), next_obses[:H]], dim=0)   # (H+1, B, D)
+        obs_seq = torch.cat([obs.unsqueeze(0), next_obses], dim=0)       # (H+1, B, D)
         z_all = self.model.h(obs_seq)                                    # (H+1, B, latent)
 
         # Predicted next latents z_hat_{t+1} = f(z_t, a_t), t = 0..H-1.

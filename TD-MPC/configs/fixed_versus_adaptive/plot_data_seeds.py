@@ -113,27 +113,48 @@ def load_training_data():
     return experiments
 
 
+# Two-sided 95% Student-t critical values, indexed by degrees of freedom - 1.
+_T_CRIT_95 = np.array([
+    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
+    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
+    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+])
+
+
+def _ci95_halfwidth(values):
+    """Half-width of the 95% confidence interval of the across-seed mean
+    (t * sample std / sqrt(n)) at each step, using however many seeds are
+    finite there. Zero where fewer than two seeds are available."""
+    n = np.isfinite(values).sum(axis=0)
+    df = np.maximum(n - 1, 1)
+    t = np.where(df <= len(_T_CRIT_95), _T_CRIT_95[np.minimum(df, len(_T_CRIT_95)) - 1], 1.96)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)   # columns with < 2 finite seeds
+        sem = np.nanstd(values, axis=0, ddof=1) / np.sqrt(np.maximum(n, 1))
+    return np.where(n > 1, t * sem, 0.0)
+
+
 def _plot_series(ax, steps, values, window, label, log=False):
     """Plot the across-seed mean (of per-seed rolling averages) as a bold line,
-    with a lighter +-1 std band across seeds, plus the across-seed mean of the
-    raw (unsmoothed) values as a faint line."""
+    with a lighter 95% confidence band of that mean across seeds, plus the
+    across-seed mean of the raw (unsmoothed) values as a faint line."""
     steps = np.asarray(steps, dtype=float)
     smoothed = rolling_average(values, window)          # (num_seeds, N)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN columns (seed phase)
         mean = np.nanmean(smoothed, axis=0)
-        std = np.nanstd(smoothed, axis=0)
         raw_mean = np.nanmean(values, axis=0)
+    ci = _ci95_halfwidth(smoothed)
 
     mask = np.isfinite(mean)
     if not mask.any():
         return
     raw_mask = np.isfinite(raw_mean)
     raw_steps, raw_mean = steps[raw_mask], raw_mean[raw_mask]
-    steps, mean, std = steps[mask], mean[mask], std[mask]
+    steps, mean, ci = steps[mask], mean[mask], ci[mask]
 
-    lower, upper = mean - std, mean + std
+    lower, upper = mean - ci, mean + ci
     if log:
         # Keep the band drawable on a log axis.
         lower = np.maximum(lower, mean * 1e-2)
@@ -162,7 +183,7 @@ def plot_fixed_versus_adaptive(window=5):
 
         ax.set_xlabel("Step")
         ax.set_ylabel(ylabel)
-        ax.set_title(f"{title}: Fixed vs Adaptive dt (mean ± std over seeds)")
+        ax.set_title(f"{title}: Fixed vs Adaptive dt (mean ± 95% CI over seeds)")
         ax.legend()
         ax.grid(True)
 

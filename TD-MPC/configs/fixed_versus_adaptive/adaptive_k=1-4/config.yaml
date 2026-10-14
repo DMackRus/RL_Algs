@@ -2,7 +2,7 @@ name: TD-MPC (default)
 device: cuda
 
 # Task parameters
-task: pointmass-easy        # dm_control domain-task (e.g. cheetah-run, cartpole-swingup, quadruped-run)
+task: cartpole-swingup        # dm_control domain-task (e.g. cheetah-run, cartpole-swingup, quadruped-run)
 action_repeat: 2         # env steps executed per agent action
 image_observations: False
 

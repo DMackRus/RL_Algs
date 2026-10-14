@@ -5,54 +5,45 @@ device: cuda
 # dm_control domain-task. Needs a task-specific goal state in goals.py:
 #   reacher-easy / reacher-hard, cartpole-swingup / cartpole-balance,
 #   cup-catch (ball_in_cup), pendulum-swingup, acrobot-swingup,
-#   finger-turn_easy / finger-turn_hard, walker-*, hopper-*
+#   finger-turn_easy / finger-turn_hard, walker-*, hopper-*, point_mass-*
+benchmark: dmc
 task: reacher-hard
 action_repeat: 2
-image_observations: False
+image_observations: False    # state only (env.py still reads this key)
 modality: state
-benchmark: dmc
 seed: 1
 
-# Training algorithm
-training_algorithm: lewm
-seed_steps: 5000
-eval_policy_every: 5
+# Training
+num_seeds: 1
+seed_steps: 5000             # random actions until this many env steps
+eval_policy_every: 5         # evaluate every N collected episodes
 eval_episodes: 5
 train_steps: 30000
 
-# Replay buffer (uniform sampling: reward-free, no priority signal by default)
+# Replay buffer (uniform by default: reward-free, no priority signal)
 replay_capacity: 1000000
-prioritized_replay: False
+prioritized_replay: False    # true -> prioritize by next-latent prediction error
 per_alpha: 0.6
 per_beta: 0.4
-per_beta_frames: 50000
-lewm_prioritized: False        # true -> prioritize by next-latent prediction error
 
 # ---------------------------------------------------------------------------
 # LeWM model / loss
 # ---------------------------------------------------------------------------
 latent_dim: 50
-lewm_enc_dim: 256              # encoder trunk hidden width
-lewm_mlp_dim: 512             # latent predictor hidden width
+enc_dim: 256                 # encoder trunk hidden width
+mlp_dim: 512                 # latent predictor hidden width
 lr: 3e-4
 grad_clip_norm: 10
 batch_size: 256
 
-sigreg_weight: 0.1            # lambda on SIGReg (paper default)
+sigreg_weight: 0.1           # lambda on SIGReg (paper default)
 sigreg_num_proj: 512         # random projections (paper: 1024; lower = less VRAM)
 sigreg_knots: 17
 
 # ---------------------------------------------------------------------------
-# Exploratory data collection (reward-free: no planning during training)
+# Goal-conditioned CEM planning
 # ---------------------------------------------------------------------------
-exploration: uniform         # uniform | brownian
-expl_std: 0.3                # brownian step std
-
-# ---------------------------------------------------------------------------
-# Goal-conditioned CEM planning (evaluation only)
-# ---------------------------------------------------------------------------
-planner: CEM
-horizon: 5
+horizon: 5                   # planning horizon and training rollout length
 goal_cost: terminal          # terminal | dense
 goal_success_dist: 0.05      # |obs - goal| below this counts as success
 
@@ -64,19 +55,3 @@ CEM:
   temperature: 0.5
   momentum: 0.1
   num_opt_iterations: 8
-
-# Kept for compatibility with shared modules (replay_buffer / env).
-frame_stack: 1
-aug_pad: 0
-sampling_noise: 0.3
-discount: 0.99
-gamma: 0.99
-enc_dim: 256
-mlp_dim: 512
-num_channels: 32
-img_size: 64
-obs_shape: null
-dt_base: null
-k_min: 1
-k_max: 4
-k_sampling: step

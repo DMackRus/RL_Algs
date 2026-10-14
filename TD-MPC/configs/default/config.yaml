@@ -10,7 +10,7 @@ image_observations: False
 metaworld_task_idx: 0    # benchmark: metaworld only -> which of the 50 fixed goal variants to use (index into mt1.train_tasks)
 
 # Training parameters
-training_algorithm: tdmpc_adaptive  #tdmpc, tdmpc_adaptive, lewm
+training_algorithm: tdmpc_adaptive  #tdmpc, tdmpc_adaptive
 seed_steps: 5000    #was 5000
 eval_policy_every: 5
 eval_episodes: 5

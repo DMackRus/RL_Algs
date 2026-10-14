@@ -14,8 +14,6 @@ from utils import symlog, symexp, make_frame_stacker, process_image
 from env import make_env
 from tdmpc import TDMPC
 from tdmpc_adaptive import TDMPCAdaptive
-from lewm import LeWM
-from goals import goal_observation
 
 class Logger:
     """Collects per-iteration training / evaluation rewards and update metrics.
@@ -131,35 +129,6 @@ def evaluate(env, agent, num_episodes, step):
     return float(np.mean(rewards)), float(np.mean(lengths))
 
 
-@T.no_grad()
-def evaluate_lewm(env, agent, num_episodes, step, cfg):
-    """Goal-conditioned rollout for LeWM. Reward-free: score each episode by how
-    close the achieved observation gets to a task-specific goal observation
-    (see goals.py). Returns per-episode (final distance, best distance, success)
-    where success == best distance < cfg['goal_success_dist']."""
-    thr = float(cfg.get("goal_success_dist", 0.1))
-    rewards, finals, bests, succ = [], [], [], []
-    for _ in range(num_episodes):
-        obs = env.reset()
-        goal = goal_observation(env)
-        agent.set_goal(goal)
-        done, t, best = False, 0, float("inf")
-        d = float("inf")
-        ep_reward = 0.0
-        while not done:
-
-            action = agent.plan(obs, eval_mode=True, step=step, t0=(t == 0))
-            obs, _reward, done, _ = env.step(action.cpu().numpy())
-            ep_reward += _reward
-            d = float(np.linalg.norm(np.asarray(obs, np.float32) - goal))
-            best = min(best, d)
-            t += 1
-        rewards.append(ep_reward)
-        finals.append(d)
-        bests.append(best)
-        succ.append(float(best < thr))
-    return rewards, finals, bests, succ
-
 def set_seed(seed):
     """Set the random seed for reproducibility."""
     np.random.seed(seed)
@@ -206,8 +175,6 @@ def testing_run(config_filepath):
     #     raise NotImplementedError("SAC training not yet implemented.")
     # elif config["training_algorithm"] == "tdmpc_adaptive":
     #     agent = TDMPCAdaptive(config)
-    # elif config["training_algorithm"] == "lewm":
-    #     agent = LeWM(config)
     # else:
     #     raise ValueError(f"Unknown training algorithm: {config['training_algorithm']}")
 
@@ -230,8 +197,6 @@ def testing_run(config_filepath):
             raise NotImplementedError("SAC training not yet implemented.")
         elif config["training_algorithm"] == "tdmpc_adaptive":
             agent = TDMPCAdaptive(config)
-        elif config["training_algorithm"] == "lewm":
-            agent = LeWM(config)
         else:
             raise ValueError(f"Unknown training algorithm: {config['training_algorithm']}")
 
@@ -239,9 +204,6 @@ def testing_run(config_filepath):
 
             obs = env.reset()
             episode = Episode(config, obs)
-            if config["training_algorithm"] == "lewm":
-                    goal = goal_observation(env)
-                    agent.set_goal(goal)
             while not episode.done:
                 action = agent.plan(obs, step=step, t0=episode.first)
                 obs, reward, done, _ = env.step(action.cpu().numpy())
@@ -261,22 +223,8 @@ def testing_run(config_filepath):
             # Evaluate the current policy periodically (noise-free planning). The
             # score is carried forward by the logger onto the intervening iterations.
             if step >= config["seed_steps"] and episode_idx % EVAL_EVERY == 0:
-                if config["training_algorithm"] == "lewm":
-                    rewards, finals, bests, succ = evaluate_lewm(env, agent, EVAL_EPISODES, step, config)
-                    # Log negative best goal-distance as the "reward" so the existing
-                    # plotting lines up; eval_length carries the success rate.
-                    eval_reward, eval_length = -float(np.mean(bests)), float(np.mean(succ))
-                    train_metrics.update({
-                        "goal_dist_final": float(np.mean(finals)),
-                        "goal_dist_best": float(np.mean(bests)),
-                        "goal_success_rate": float(np.mean(succ)),
-                    })
-                    print(f"Step {step}: Eval rewards: {np.mean(rewards):.2f}, "
-                        f"goal dist (best) {np.mean(bests):.3f}, "
-                        f"final {np.mean(finals):.3f}, success {np.mean(succ):.2f}")
-                else:
-                    eval_reward, eval_length = evaluate(env, agent, EVAL_EPISODES, step)
-                    print(f"Step {step}: eval reward over {EVAL_EPISODES} episodes: {eval_reward:.2f}")
+                eval_reward, eval_length = evaluate(env, agent, EVAL_EPISODES, step)
+                print(f"Step {step}: eval reward over {EVAL_EPISODES} episodes: {eval_reward:.2f}")
                 logger.set_eval(eval_reward, eval_length)
 
                 os.makedirs(f"{folder_path}/model_checkpoints", exist_ok=True)
@@ -303,9 +251,6 @@ if __name__ == "__main__":
 
     #Just a single testing run
     # testing_run("configs/default/config.yaml")
-
-    # LeWorldModel (reward-free JEPA world model, goal-conditioned planning)
-    # testing_run("configs/lewm/config.yaml")
 
 
     # # test_name = "testing_horizons"

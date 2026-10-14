@@ -23,6 +23,8 @@ and are easy to tune here. Unsupported tasks raise ``NotImplementedError`` with
 the list of what *is* supported.
 """
 
+import contextlib
+
 import numpy as np
 
 
@@ -159,12 +161,12 @@ def supported_domains():
     return sorted(_REGISTRY)
 
 
-def goal_observation(env):
-    """Goal observation vector for a dm_control-backed env, in run-time layout.
+@contextlib.contextmanager
+def _goal_pose(env):
+    """Temporarily put the sim into the goal pose; yields ``(physics, task)``.
 
-    Must be called *after* ``env.reset()`` (some goals - reacher, finger,
-    point_mass - depend on the per-episode target). Does not disturb the live
-    episode.
+    Snapshots the live sim state first and restores it on exit, so the running
+    episode is left untouched.
     """
     physics, task = _dmc_handles(env)
     domain = _domain_name(task)
@@ -175,7 +177,6 @@ def goal_observation(env):
             f"supported: {supported_domains()}"
         )
 
-    # Snapshot the live sim state so the running episode is left untouched.
     saved_qpos = physics.data.qpos.copy()
     saved_qvel = physics.data.qvel.copy()
     saved_act = physics.data.act.copy() if int(physics.model.na) else None
@@ -185,11 +186,31 @@ def goal_observation(env):
         handler(physics, task)
         physics.data.qvel[:] = 0.0          # goal is always "at rest"
         physics.forward()
-        goal = _flatten_obs(task.get_observation(physics))
+        yield physics, task
     finally:
         physics.data.qpos[:] = saved_qpos
         physics.data.qvel[:] = saved_qvel
         if saved_act is not None:
             physics.data.act[:] = saved_act
         physics.forward()
+
+
+def goal_observation(env):
+    """Goal observation vector for a dm_control-backed env, in run-time layout.
+
+    Must be called *after* ``env.reset()`` (some goals - reacher, finger,
+    point_mass - depend on the per-episode target). Does not disturb the live
+    episode.
+    """
+    with _goal_pose(env) as (physics, task):
+        goal = _flatten_obs(task.get_observation(physics))
     return goal.astype(np.float32)
+
+
+def render_goal(env, width=384, height=384, camera_id=0):
+    """RGB image (H, W, 3) of the goal pose, for checking goals by eye. Same
+    camera choice as env.DMCEnv.render. Call after ``env.reset()``; does not
+    disturb the live episode."""
+    camera_id = dict(quadruped=2).get(getattr(env, "domain", None), camera_id)
+    with _goal_pose(env) as (physics, task):
+        return physics.render(height, width, camera_id)

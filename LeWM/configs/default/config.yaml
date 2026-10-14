@@ -1,0 +1,57 @@
+name: LeWorldModel (state)
+device: cuda
+
+# Task parameters
+# dm_control domain-task. Needs a task-specific goal state in goals.py:
+#   reacher-easy / reacher-hard, cartpole-swingup / cartpole-balance,
+#   cup-catch (ball_in_cup), pendulum-swingup, acrobot-swingup,
+#   finger-turn_easy / finger-turn_hard, walker-*, hopper-*, point_mass-*
+benchmark: dmc
+task: cartpole-swingup
+action_repeat: 2
+image_observations: False    # state only (env.py still reads this key)
+modality: state
+seed: 1
+
+# Training
+num_seeds: 1
+seed_steps: 5000             # random actions until this many env steps
+eval_policy_every: 5         # evaluate every N collected episodes
+eval_episodes: 5
+train_steps: 30000
+
+# Replay buffer (uniform by default: reward-free, no priority signal)
+replay_capacity: 1000000
+prioritized_replay: False    # true -> prioritize by next-latent prediction error
+per_alpha: 0.6
+per_beta: 0.4
+
+# ---------------------------------------------------------------------------
+# LeWM model / loss
+# ---------------------------------------------------------------------------
+latent_dim: 50
+enc_dim: 256                 # encoder trunk hidden width
+mlp_dim: 512                 # latent predictor hidden width
+lr: 3e-4
+grad_clip_norm: 10
+batch_size: 256
+
+sigreg_weight: 0.1           # lambda on SIGReg (paper default)
+sigreg_num_proj: 512         # random projections (paper: 1024; lower = less VRAM)
+sigreg_knots: 17
+
+# ---------------------------------------------------------------------------
+# Goal-conditioned CEM planning
+# ---------------------------------------------------------------------------
+horizon: 5                   # planning horizon and training rollout length
+goal_cost: terminal          # terminal | dense
+goal_success_dist: 0.05      # |obs - goal| below this counts as success
+
+CEM:
+  num_candidates: 256
+  num_elites: 64
+  noise_std: 0.1             # floor on per-step sampling std
+  max_noise_std: 2.0         # ceiling / initial per-step sampling std
+  temperature: 0.5
+  momentum: 0.1
+  num_opt_iterations: 8
