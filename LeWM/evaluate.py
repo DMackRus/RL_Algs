@@ -8,9 +8,10 @@ import yaml
 import cv2
 import numpy as np
 from env import make_env
-from lewm import LeWM
+import lewm_adaptive
 from goals import goal_observation
 from replay_buffer import Episode
+from train import make_agent
 
 def save_video(frames, path, fps=15):
     """Write a list of RGB uint8 (H, W, 3) frames to an mp4."""
@@ -29,7 +30,7 @@ def save_video(frames, path, fps=15):
 
 if __name__ == "__main__":
 
-    test_folder = "configs/reacher_hard"
+    test_folder = "configs/default"
     yaml_name = "config.yaml"
     model_name = "checkpoint_step30000.pt"
     video_folder_name = "eval_videos"
@@ -48,8 +49,10 @@ if __name__ == "__main__":
     config["action_dim"] = action_dim
     config["state_dim"] = state_dim
     config["episode_length"] = env.ep_len
+    if config.get("algorithm") == "lewm_adaptive":
+        config["buffer_window"] = lewm_adaptive.required_window(config)
 
-    agent = LeWM(config)
+    agent = make_agent(config)
     agent.load(test_folder + "/model_checkpoints/" + model_name)
 
     num_eval_episodes = config["eval_episodes"]

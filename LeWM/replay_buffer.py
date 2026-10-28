@@ -52,7 +52,10 @@ class ReplayBuffer():
         self.device = cfg["device"]
         self.capacity = cfg["replay_capacity"]
         self.episode_length = cfg["episode_length"]
-        self.horizon = cfg["horizon"]
+        self.horizon = cfg.get("horizon")
+        # Steps reserved at each episode end so a sampled window stays inside one
+        # episode. lewm_adaptive sets buffer_window to its longest level span.
+        self.window = cfg.get("buffer_window", self.horizon)
         self.batch_size = cfg["batch_size"]
         self.per_alpha = cfg.get("per_alpha", 0.6) if cfg.get("prioritized_replay", False) else 0.0
         self.per_beta = cfg.get("per_beta", 0.4)
@@ -82,10 +85,10 @@ class ReplayBuffer():
         else:
             max_priority = 1. if self.idx == 0 else self._priorities[:self.idx].max().item()
         # Zero the priority of start states too close to the episode end, so a
-        # sampled window o_t .. o_{t+H} always stays inside one stored episode.
-        assert self.horizon < L, "training window longer than an episode"
+        # sampled window o_t .. o_{t+window} always stays inside one stored episode.
+        assert self.window < L, "training window longer than an episode"
         new_priorities = torch.full((L,), max_priority, device=self.device)
-        new_priorities[torch.arange(L, device=self.device) >= L - self.horizon] = 0
+        new_priorities[torch.arange(L, device=self.device) >= L - self.window] = 0
         self._priorities[self.idx:self.idx+L] = new_priorities
         self.idx = (self.idx + L) % self.capacity
         self._full = self._full or self.idx == 0
@@ -116,3 +119,19 @@ class ReplayBuffer():
         next_obs = torch.stack([self._obs[idxs + t + 1] for t in range(H)], dim=0)
         action = torch.stack([self._action[idxs + t] for t in range(H)], dim=0)
         return obs, next_obs, action, idxs, weights
+
+    def sample_strided(self, horizon, stride):
+        """Uniform sample of H steps at a stride of k base steps (lewm_adaptive).
+        Requires horizon * stride <= buffer_window. Returns
+            obs     (H+1, B, D)       o_t, o_{t+k}, .., o_{t+Hk}
+            chunks  (H, B, k, A)      chunks[i] = a_{t+ik} .. a_{t+ik+k-1}
+        """
+        assert horizon * stride <= self.window, "strided window longer than buffer_window"
+        priorities = self._priorities if self._full else self._priorities[:self.idx]
+        idxs = torch.multinomial((priorities > 0).float(), self.batch_size, replacement=True)
+
+        steps = torch.arange(horizon + 1, device=self.device) * stride
+        obs = self._obs[idxs.unsqueeze(0) + steps.unsqueeze(1)]
+        offs = torch.arange(horizon * stride, device=self.device).view(horizon, 1, stride)
+        chunks = self._action[idxs.view(1, -1, 1) + offs]
+        return obs, chunks

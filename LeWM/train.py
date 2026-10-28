@@ -8,6 +8,7 @@ from collections import defaultdict
 from replay_buffer import ReplayBuffer, Episode
 from env import make_env
 from lewm import LeWM
+import lewm_adaptive
 from goals import goal_observation
 
 
@@ -146,6 +147,16 @@ def evaluate(env, agent, num_episodes, step, cfg):
     )
 
 
+def make_agent(cfg):
+    """Build the agent named by cfg["algorithm"] (lewm | lewm_adaptive)."""
+    algorithm = cfg.get("algorithm", "lewm")
+    if algorithm == "lewm":
+        return LeWM(cfg)
+    if algorithm == "lewm_adaptive":
+        return lewm_adaptive.LeWMAdaptive(cfg)
+    raise ValueError(f"unknown algorithm '{algorithm}'")
+
+
 def set_seed(seed):
     """Set the random seed for reproducibility."""
     np.random.seed(seed)
@@ -174,6 +185,8 @@ def testing_run(config_filepath):
     config["action_dim"] = action_dim
     config["state_dim"] = state_dim
     config["episode_length"] = env.ep_len
+    if config.get("algorithm") == "lewm_adaptive":
+        config["buffer_window"] = lewm_adaptive.required_window(config)
 
     print(f"Env control timestep: {env.control_timestep()}")
     print(f"Env episode length: {config['episode_length']}")
@@ -185,7 +198,7 @@ def testing_run(config_filepath):
         episode_idx = 0
         replay_buffer = ReplayBuffer(config)
         logger = Logger(folder_path, config, seed=seed)
-        agent = LeWM(config)
+        agent = make_agent(config)
 
         for step in range(0, config["train_steps"]+config["episode_length"], config["episode_length"]):
 
@@ -235,4 +248,5 @@ def testing_run(config_filepath):
 
 if __name__ == "__main__":
 
-    testing_run("configs/reacher_hard/config.yaml")
+    # testing_run("configs/adaptive_default/config.yaml")
+    testing_run("configs/default/config.yaml")
